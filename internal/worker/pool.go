@@ -1,0 +1,199 @@
+package worker
+
+import (
+	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"fmt"
+	"log"
+	"net/url"
+	"path/filepath"
+	"time"
+
+	"napcat-file-mover/internal/config"
+	"napcat-file-mover/internal/downloader"
+	"napcat-file-mover/internal/napcat"
+	"napcat-file-mover/internal/repository"
+	"napcat-file-mover/internal/security"
+	"napcat-file-mover/internal/storage"
+)
+
+type Pool struct {
+	cfg        *config.Config
+	repo       *repository.SQLite
+	napcat     *napcat.Client
+	downloader *downloader.HTTPDownloader
+	storage    *storage.Local
+	limiter    *SemaphoreLimiter
+	cancel     context.CancelFunc
+}
+
+func New(cfg *config.Config, repo *repository.SQLite, nc *napcat.Client, dl *downloader.HTTPDownloader, st *storage.Local) *Pool {
+	lim := NewLimiter(4)
+	lim.Add("global:download", cfg.RateLimit.GlobalDownloads)
+	lim.Add("qq:api", cfg.NapCat.MaxConcurrentRequests)
+	return &Pool{cfg: cfg, repo: repo, napcat: nc, downloader: dl, storage: st, limiter: lim}
+}
+
+func (p *Pool) Start(ctx context.Context) {
+	ctx, p.cancel = context.WithCancel(ctx)
+	workers := p.cfg.Worker.MaxActiveTasks
+	if workers <= 0 {
+		workers = 8
+	}
+	for i := 0; i < workers; i++ {
+		go p.run(ctx, i)
+	}
+}
+
+func (p *Pool) Stop() {
+	if p.cancel != nil {
+		p.cancel()
+	}
+}
+
+func (p *Pool) run(ctx context.Context, id int) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		task, err := p.repo.ClaimNext(ctx)
+		if err != nil {
+			log.Printf("worker %d claim: %v", id, err)
+			time.Sleep(time.Second)
+			continue
+		}
+		if task == nil {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if err := p.handle(ctx, task); err != nil {
+			log.Printf("task %d failed: %v", task.ID, err)
+			_ = p.repo.MarkFailedOrRetry(ctx, task, err)
+			continue
+		}
+		_ = p.repo.MarkDone(ctx, task)
+	}
+}
+
+func (p *Pool) handle(ctx context.Context, t *repository.Task) error {
+	switch t.TaskType {
+	case repository.TaskWebToStorage:
+		return p.handleWebToStorage(ctx, t)
+	case repository.TaskWebToQQ:
+		return p.handleWebToQQ(ctx, t)
+	case repository.TaskQQToStorage:
+		return p.handleQQToStorage(ctx, t)
+	case repository.TaskQQToQQ:
+		if err := p.handleQQToQQ(ctx, t); err == nil {
+			return nil
+		}
+		return p.handleQQToUpload(ctx, t)
+	default:
+		return fmt.Errorf("unknown task type %s", t.TaskType)
+	}
+}
+
+func (p *Pool) handleWebToStorage(ctx context.Context, t *repository.Task) error {
+	res, err := p.download(ctx, t.SourceURL, t.FileName, t.ID)
+	if err != nil {
+		return err
+	}
+	t.SHA256, t.FileSize, t.ContentType = res.SHA256, res.Size, res.ContentType
+	path, err := p.storage.PutFile(ctx, res.Path, t.FileName)
+	if err != nil {
+		return err
+	}
+	t.TargetStoragePath = path
+	return nil
+}
+
+func (p *Pool) handleWebToQQ(ctx context.Context, t *repository.Task) error {
+	res, err := p.download(ctx, t.SourceURL, t.FileName, t.ID)
+	if err != nil {
+		return err
+	}
+	t.SHA256, t.FileSize, t.ContentType = res.SHA256, res.Size, res.ContentType
+	release, err := p.limiter.Wait(ctx, fmt.Sprintf("group:upload:%d", t.TargetGroupID))
+	if err != nil {
+		return err
+	}
+	defer release()
+	return p.napcat.UploadGroupFile(ctx, t.TargetGroupID, res.Path, t.FileName, t.TargetFolderID)
+}
+
+func (p *Pool) handleQQToStorage(ctx context.Context, t *repository.Task) error {
+	release, err := p.limiter.Wait(ctx, "qq:api")
+	if err != nil {
+		return err
+	}
+	url, err := p.napcat.GetGroupFileURL(ctx, t.SourceGroupID, t.SourceFileID, t.SourceBusID)
+	release()
+	if err != nil {
+		return err
+	}
+	res, err := p.download(ctx, url, t.FileName, t.ID)
+	if err != nil {
+		return err
+	}
+	t.SHA256, t.FileSize = res.SHA256, res.Size
+	path, err := p.storage.PutFile(ctx, res.Path, t.FileName)
+	if err != nil {
+		return err
+	}
+	t.TargetStoragePath = path
+	return nil
+}
+
+func (p *Pool) handleQQToQQ(ctx context.Context, t *repository.Task) error {
+	release, err := p.limiter.Wait(ctx, "qq:api")
+	if err != nil {
+		return err
+	}
+	defer release()
+	return p.napcat.TransGroupFile(ctx, t.SourceGroupID, t.TargetGroupID, t.SourceFileID, t.SourceBusID)
+}
+
+func (p *Pool) handleQQToUpload(ctx context.Context, t *repository.Task) error {
+	if err := p.handleQQToStorage(ctx, t); err != nil {
+		return err
+	}
+	release, err := p.limiter.Wait(ctx, fmt.Sprintf("group:upload:%d", t.TargetGroupID))
+	if err != nil {
+		return err
+	}
+	defer release()
+	return p.napcat.UploadGroupFile(ctx, t.TargetGroupID, t.TargetStoragePath, t.FileName, t.TargetFolderID)
+}
+
+func (p *Pool) download(ctx context.Context, rawURL, name string, taskID int64) (downloader.Result, error) {
+	release, err := p.limiter.Wait(ctx, "global:download")
+	if err != nil {
+		return downloader.Result{}, err
+	}
+	defer release()
+	if u, err := url.Parse(rawURL); err == nil && u.Hostname() != "" {
+		hostRelease, err := p.limiter.Wait(ctx, "host:"+u.Hostname())
+		if err != nil {
+			return downloader.Result{}, err
+		}
+		defer hostRelease()
+	}
+	name = security.SanitizeFilename(name)
+	if name == "unnamed" {
+		name = fmt.Sprintf("task-%d.bin", taskID)
+	}
+	dst := filepath.Join(p.cfg.Paths.CacheDir, fmt.Sprintf("%d-%s", taskID, name))
+	return p.downloader.Download(ctx, rawURL, dst)
+}
+
+func Idempotency(parts ...string) string {
+	h := sha1.New()
+	for _, p := range parts {
+		_, _ = h.Write([]byte(p))
+		_, _ = h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}

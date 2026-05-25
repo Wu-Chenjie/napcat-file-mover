@@ -1,0 +1,14 @@
+# Go
+/mover
+/napcat-file-mover
+*.test
+
+# Frontend
+/frontend/node_modules/
+/frontend/package.json.md5
+
+# Wails/package outputs
+/build/bin/
+
+# OS/editor
+.DS_Store

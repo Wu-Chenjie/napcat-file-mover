@@ -1,0 +1,17 @@
+{
+  "name": "napcat-file-mover-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "svelte": "^5.15.0",
+    "vite": "^6.0.7"
+  },
+  "devDependencies": {}
+}

@@ -1,0 +1,49 @@
+app:
+  admin_token: "change-me"
+
+server:
+  listen: "127.0.0.1:8088"
+
+napcat:
+  endpoint: "http://127.0.0.1:3000"
+  token: "change-me"
+  timeout_seconds: 30
+  max_concurrent_requests: 8
+  retry_max_attempts: 3
+
+bot:
+  admins:
+    - 123456789
+  allowed_groups:
+    - 111111111
+
+website:
+  allowed_hosts:
+    - "example.com"
+  max_file_size_mb: 2048
+  user_agent: "NapCatFileMover/0.1"
+
+database:
+  path: ""
+
+storage:
+  local_root: ""
+
+worker:
+  download_workers: 16
+  upload_workers: 4
+  max_active_tasks: 32
+  buffer_size_kb: 512
+  max_retries: 5
+
+rate_limit:
+  qq_api_rps: 2
+  group_upload_rpm: 6
+  per_host_downloads: 4
+  global_downloads: 16
+
+search:
+  embedding_endpoint: ""
+  high_confidence: 0.72
+  max_batch_files: 50
+  max_batch_size_mb: 2048

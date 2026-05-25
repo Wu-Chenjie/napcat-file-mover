@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "NapCatFileMover",
+  "outputfilename": "NapCatFileMover",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev -- --host 127.0.0.1",
+  "frontend:dev:serverUrl": "http://127.0.0.1:5173",
+  "author": {
+    "name": "NapCat File Mover",
+    "email": ""
+  },
+  "info": {
+    "productName": "NapCat File Mover",
+    "productVersion": "0.1.0",
+    "copyright": "Copyright 2026",
+    "comments": "NapCat QQ file mover"
+  }
+}
