@@ -36,25 +36,54 @@ func New(endpoint, token string, timeout time.Duration, maxConcurrent int) *Clie
 	}
 }
 
+type LoginInfo struct {
+	UserID   int64  `json:"user_id"`
+	Nickname string `json:"nickname"`
+}
+
+func (c *Client) GetLoginInfo(ctx context.Context) (LoginInfo, error) {
+	var info LoginInfo
+	err := c.call(ctx, "get_login_info", map[string]any{}, &info)
+	return info, err
+}
+
 func (c *Client) SendGroupMsg(ctx context.Context, groupID int64, message string) error {
 	var out json.RawMessage
 	return c.call(ctx, "send_group_msg", map[string]any{"group_id": groupID, "message": message}, &out)
 }
 
-func (c *Client) GetGroupRootFiles(ctx context.Context, groupID int64) ([]QQFile, error) {
-	var data struct {
-		Files []QQFile `json:"files"`
+func (c *Client) SendGroupForwardMsg(ctx context.Context, groupID int64, nodes []ForwardNode) error {
+	messages := make([]map[string]any, 0, len(nodes))
+	for _, node := range nodes {
+		messages = append(messages, map[string]any{
+			"type": "node",
+			"data": node,
+		})
 	}
-	err := c.call(ctx, "get_group_root_files", map[string]any{"group_id": groupID}, &data)
+	var out json.RawMessage
+	return c.call(ctx, "send_group_forward_msg", map[string]any{"group_id": groupID, "messages": messages}, &out)
+}
+
+func (c *Client) GetGroupRootFiles(ctx context.Context, groupID int64) ([]QQFile, error) {
+	data, err := c.GetGroupRootEntries(ctx, groupID)
 	return data.Files, err
 }
 
 func (c *Client) GetGroupFilesByFolder(ctx context.Context, groupID int64, folderID string) ([]QQFile, error) {
-	var data struct {
-		Files []QQFile `json:"files"`
-	}
-	err := c.call(ctx, "get_group_files_by_folder", map[string]any{"group_id": groupID, "folder_id": folderID}, &data)
+	data, err := c.GetGroupFolderEntries(ctx, groupID, folderID)
 	return data.Files, err
+}
+
+func (c *Client) GetGroupRootEntries(ctx context.Context, groupID int64) (QQFileList, error) {
+	var data QQFileList
+	err := c.call(ctx, "get_group_root_files", map[string]any{"group_id": groupID}, &data)
+	return data, err
+}
+
+func (c *Client) GetGroupFolderEntries(ctx context.Context, groupID int64, folderID string) (QQFileList, error) {
+	var data QQFileList
+	err := c.call(ctx, "get_group_files_by_folder", map[string]any{"group_id": groupID, "folder_id": folderID}, &data)
+	return data, err
 }
 
 func (c *Client) GetGroupFileURL(ctx context.Context, groupID int64, fileID string, busID int32) (string, error) {

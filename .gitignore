@@ -1,5 +1,6 @@
 # Go
 /mover
+/mover.exe
 /napcat-file-mover
 *.test
 
@@ -9,6 +10,17 @@
 
 # Wails/package outputs
 /build/bin/
+/build/windows/
+
+# Temp/build artifacts
+mover.exe~
+*~
 
 # OS/editor
 .DS_Store
+dist/
+
+# Logs and temp
+*.log
+.gocache/
+.gocache-test/

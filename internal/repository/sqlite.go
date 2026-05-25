@@ -271,10 +271,8 @@ func (s *SQLite) UpsertCatalog(ctx context.Context, f FileCatalog) error {
 		row := tx.QueryRowContext(ctx, `SELECT id FROM file_catalog WHERE group_id = ? AND file_id = ? AND bus_id = ? AND file_size = ?`, f.GroupID, f.FileID, f.BusID, f.FileSize)
 		_ = row.Scan(&id)
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO file_catalog_fts(rowid, file_name, folder_path, normalized_text, pinyin, initials, ngrams)
-		VALUES(?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(rowid) DO UPDATE SET file_name = excluded.file_name, folder_path = excluded.folder_path,
-		normalized_text = excluded.normalized_text, pinyin = excluded.pinyin, initials = excluded.initials, ngrams = excluded.ngrams`,
+	_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO file_catalog_fts(rowid, file_name, folder_path, normalized_text, pinyin, initials, ngrams)
+		VALUES(?, ?, ?, ?, ?, ?, ?)`,
 		id, f.FileName, f.FolderPath, f.NormalizedText, f.Pinyin, f.Initials, f.NGrams)
 	if err != nil {
 		return err
@@ -301,7 +299,7 @@ func (s *SQLite) SearchFiles(ctx context.Context, query string, groupID int64, e
 	if len(where) > 0 {
 		baseWhere = " AND " + strings.Join(where, " AND ")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.group_id, c.folder_id, c.folder_path, c.file_id, c.bus_id, c.file_name, c.ext, c.file_size,
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.group_id, COALESCE(c.folder_id, ''), COALESCE(c.folder_path, ''), c.file_id, c.bus_id, c.file_name, COALESCE(c.ext, ''), c.file_size,
 		c.normalized_text, c.pinyin, c.initials, c.ngrams, c.updated_at, bm25(file_catalog_fts) AS rank
 		FROM file_catalog_fts JOIN file_catalog c ON c.id = file_catalog_fts.rowid
 		WHERE file_catalog_fts MATCH ?`+baseWhere+` ORDER BY rank LIMIT ?`, append([]any{matchExpr}, append(args, limit)...)...)
@@ -337,7 +335,7 @@ func (s *SQLite) searchLike(ctx context.Context, query string, groupID int64, ex
 		args = append(args, ext)
 	}
 	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, `SELECT id, group_id, folder_id, folder_path, file_id, bus_id, file_name, ext, file_size,
+	rows, err := s.db.QueryContext(ctx, `SELECT id, group_id, COALESCE(folder_id, ''), COALESCE(folder_path, ''), file_id, bus_id, file_name, COALESCE(ext, ''), file_size,
 		normalized_text, pinyin, initials, ngrams, updated_at FROM file_catalog WHERE `+strings.Join(where, " AND ")+` ORDER BY updated_at DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, err

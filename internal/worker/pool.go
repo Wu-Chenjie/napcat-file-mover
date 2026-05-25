@@ -87,10 +87,7 @@ func (p *Pool) handle(ctx context.Context, t *repository.Task) error {
 	case repository.TaskQQToStorage:
 		return p.handleQQToStorage(ctx, t)
 	case repository.TaskQQToQQ:
-		if err := p.handleQQToQQ(ctx, t); err == nil {
-			return nil
-		}
-		return p.handleQQToUpload(ctx, t)
+		return p.handleQQToForward(ctx, t)
 	default:
 		return fmt.Errorf("unknown task type %s", t.TaskType)
 	}
@@ -121,7 +118,7 @@ func (p *Pool) handleWebToQQ(ctx context.Context, t *repository.Task) error {
 		return err
 	}
 	defer release()
-	return p.napcat.UploadGroupFile(ctx, t.TargetGroupID, res.Path, t.FileName, t.TargetFolderID)
+	return p.sendFileForward(ctx, t.TargetGroupID, res.Path, t.FileName, fmt.Sprintf("来源: %s", t.SourceURL))
 }
 
 func (p *Pool) handleQQToStorage(ctx context.Context, t *repository.Task) error {
@@ -156,7 +153,7 @@ func (p *Pool) handleQQToQQ(ctx context.Context, t *repository.Task) error {
 	return p.napcat.TransGroupFile(ctx, t.SourceGroupID, t.TargetGroupID, t.SourceFileID, t.SourceBusID)
 }
 
-func (p *Pool) handleQQToUpload(ctx context.Context, t *repository.Task) error {
+func (p *Pool) handleQQToForward(ctx context.Context, t *repository.Task) error {
 	if err := p.handleQQToStorage(ctx, t); err != nil {
 		return err
 	}
@@ -165,7 +162,36 @@ func (p *Pool) handleQQToUpload(ctx context.Context, t *repository.Task) error {
 		return err
 	}
 	defer release()
-	return p.napcat.UploadGroupFile(ctx, t.TargetGroupID, t.TargetStoragePath, t.FileName, t.TargetFolderID)
+	source := fmt.Sprintf("来源: QQ群 %d", t.SourceGroupID)
+	if t.SourceFolderID != "" {
+		source += " / " + t.SourceFolderID
+	}
+	return p.sendFileForward(ctx, t.TargetGroupID, t.TargetStoragePath, t.FileName, source)
+}
+
+func (p *Pool) sendFileForward(ctx context.Context, groupID int64, filePath, fileName, source string) error {
+	if source == "" {
+		source = "来源: NapCatFileMover"
+	}
+	nodes := []napcat.ForwardNode{
+		{
+			UserID:   "10000",
+			Nickname: "NapCatFileMover",
+			Content: []napcat.MessageSegment{{
+				Type: "text",
+				Data: map[string]any{"text": fmt.Sprintf("搬运资料: %s\n%s", fileName, source)},
+			}},
+		},
+		{
+			UserID:   "10000",
+			Nickname: "NapCatFileMover",
+			Content: []napcat.MessageSegment{{
+				Type: "file",
+				Data: map[string]any{"file": filePath, "name": fileName},
+			}},
+		},
+	}
+	return p.napcat.SendGroupForwardMsg(ctx, groupID, nodes)
 }
 
 func (p *Pool) download(ctx context.Context, rawURL, name string, taskID int64) (downloader.Result, error) {

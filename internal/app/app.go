@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -29,16 +30,17 @@ import (
 )
 
 type Core struct {
-	cfg       *config.Config
-	repo      *repository.SQLite
-	napcat    *napcat.Client
-	gateway   *bot.Gateway
-	workers   *worker.Pool
-	server    *http.Server
-	sessions  map[string]time.Time
-	searches  map[string][]repository.SearchResult
-	sessionMu sync.Mutex
-	searchMu  sync.Mutex
+	cfg        *config.Config
+	repo       *repository.SQLite
+	napcat     *napcat.Client
+	gateway    *bot.Gateway
+	workers    *worker.Pool
+	server     *http.Server
+	wsListener *napcat.WSListener
+	sessions   map[string]time.Time
+	searches   map[string][]repository.SearchResult
+	sessionMu  sync.Mutex
+	searchMu   sync.Mutex
 }
 
 func New(cfg *config.Config) (*Core, error) {
@@ -66,10 +68,40 @@ func New(cfg *config.Config) (*Core, error) {
 	}, nil
 }
 
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func defaultWSURI(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return ""
+	}
+	u.Scheme = "ws"
+	port := u.Port()
+	if port != "" {
+		p, err := strconv.Atoi(port)
+		if err == nil {
+			u.Host = fmt.Sprintf("%s:%d", u.Hostname(), p+1)
+		}
+	}
+	return u.String()
+}
+
 func (c *Core) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	c.routes(mux)
-	c.server = &http.Server{Addr: c.cfg.Server.Listen, Handler: mux}
+	c.server = &http.Server{Addr: c.cfg.Server.Listen, Handler: corsMiddleware(mux)}
 	c.workers.Start(ctx)
 	go func() {
 		if err := c.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -77,11 +109,27 @@ func (c *Core) Start(ctx context.Context) error {
 		}
 	}()
 	log.Printf("NapCatFileMover listening on http://%s", c.cfg.Server.Listen)
+
+	wsURI := c.cfg.NapCat.WSURI
+	if wsURI == "" {
+		wsURI = defaultWSURI(c.cfg.NapCat.Endpoint)
+	}
+	if wsURI != "" {
+		c.wsListener = napcat.NewWSListener(wsURI, c.cfg.NapCat.Token, func(ev napcat.OneBotEvent) {
+			c.gateway.HandleEvent(context.Background(), ev, "")
+		})
+		if err := c.wsListener.Connect(); err != nil {
+			log.Printf("ws listener: %v (bot commands via HTTP /onebot/event still work)", err)
+		}
+	}
 	return nil
 }
 
 func (c *Core) Stop(ctx context.Context) {
 	c.workers.Stop()
+	if c.wsListener != nil {
+		_ = c.wsListener.Close()
+	}
 	if c.server != nil {
 		_ = c.server.Shutdown(ctx)
 	}
@@ -140,6 +188,7 @@ func (c *Core) onebotEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("[onebot] received: post_type=%s msg_type=%s group=%d user=%d raw=%s", ev.PostType, ev.MessageType, ev.GroupID, ev.UserID, ev.RawMessage)
 	go c.gateway.HandleEvent(context.Background(), ev, r.RemoteAddr)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -156,8 +205,9 @@ func (c *Core) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	log.Printf("login attempt: input=%q config=%q", req.Token, c.cfg.App.AdminToken)
 	if subtle.ConstantTimeCompare([]byte(req.Token), []byte(c.cfg.App.AdminToken)) != 1 {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		msg := fmt.Sprintf("unauthorized: input=%q config=%q", req.Token, c.cfg.App.AdminToken); http.Error(w, msg, http.StatusUnauthorized)
 		return
 	}
 	token, err := randomToken()
@@ -168,7 +218,7 @@ func (c *Core) login(w http.ResponseWriter, r *http.Request) {
 	c.sessionMu.Lock()
 	c.sessions[token] = time.Now().Add(24 * time.Hour)
 	c.sessionMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "mover_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Expires: time.Now().Add(24 * time.Hour)})
+	http.SetCookie(w, &http.Cookie{Name: "mover_session", Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteNoneMode, Secure: false, Expires: time.Now().Add(24 * time.Hour)})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

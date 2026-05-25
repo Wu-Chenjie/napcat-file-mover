@@ -19,7 +19,9 @@ bot:
 
 website:
   allowed_hosts:
-    - "example.com"
+    - "fireworks.jwyihao.top"
+    - "hoa.moe"
+    - "github.com"
   max_file_size_mb: 2048
   user_agent: "NapCatFileMover/0.1"
 

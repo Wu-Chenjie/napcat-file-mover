@@ -38,6 +38,7 @@ type ServerConfig struct {
 type NapCatConfig struct {
 	Endpoint              string        `yaml:"endpoint"`
 	Token                 string        `yaml:"token"`
+	WSURI                 string        `yaml:"ws_uri"`
 	TimeoutSeconds        int           `yaml:"timeout_seconds"`
 	MaxConcurrentRequests int           `yaml:"max_concurrent_requests"`
 	RetryMaxAttempts      int           `yaml:"retry_max_attempts"`

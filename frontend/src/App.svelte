@@ -17,8 +17,10 @@
   let newAdminToken = '';
   let newNapCatToken = '';
 
+  const BASE = 'http://127.0.0.1:8088';
+
   async function api(path, options = {}) {
-    const res = await fetch(path, {
+    const res = await fetch(BASE + path, {
       credentials: 'include',
       headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
       ...options
@@ -96,7 +98,7 @@
   }
 
   function connectEvents() {
-    const events = new EventSource('/api/events', { withCredentials: true });
+    const events = new EventSource(BASE + '/api/events', { withCredentials: true });
     events.addEventListener('snapshot', (event) => {
       const data = JSON.parse(event.data);
       tasks = data.tasks || tasks;
