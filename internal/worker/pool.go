@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -94,10 +95,17 @@ func (p *Pool) handle(ctx context.Context, t *repository.Task) error {
 }
 
 func (p *Pool) handleWebToStorage(ctx context.Context, t *repository.Task) error {
+	if t.SourceType == "local" {
+		if _, err := os.Stat(t.TargetStoragePath); err != nil {
+			return fmt.Errorf("local file missing: %s: %w", t.TargetStoragePath, err)
+		}
+		return nil
+	}
 	res, err := p.download(ctx, t.SourceURL, t.FileName, t.ID)
 	if err != nil {
 		return err
 	}
+	defer os.Remove(res.Path)
 	t.SHA256, t.FileSize, t.ContentType = res.SHA256, res.Size, res.ContentType
 	path, err := p.storage.PutFile(ctx, res.Path, t.FileName)
 	if err != nil {
@@ -108,17 +116,27 @@ func (p *Pool) handleWebToStorage(ctx context.Context, t *repository.Task) error
 }
 
 func (p *Pool) handleWebToQQ(ctx context.Context, t *repository.Task) error {
-	res, err := p.download(ctx, t.SourceURL, t.FileName, t.ID)
-	if err != nil {
-		return err
+	var filePath string
+	if t.SourceType == "local" {
+		filePath = t.TargetStoragePath
+		if _, err := os.Stat(filePath); err != nil {
+			return fmt.Errorf("local file missing: %s: %w", filePath, err)
+		}
+	} else {
+		res, err := p.download(ctx, t.SourceURL, t.FileName, t.ID)
+		if err != nil {
+			return err
+		}
+		filePath = res.Path
+		defer os.Remove(res.Path)
+		t.SHA256, t.FileSize, t.ContentType = res.SHA256, res.Size, res.ContentType
 	}
-	t.SHA256, t.FileSize, t.ContentType = res.SHA256, res.Size, res.ContentType
 	release, err := p.limiter.Wait(ctx, fmt.Sprintf("group:upload:%d", t.TargetGroupID))
 	if err != nil {
 		return err
 	}
 	defer release()
-	return p.sendFileForward(ctx, t.TargetGroupID, res.Path, t.FileName, fmt.Sprintf("来源: %s", t.SourceURL))
+	return p.sendFileForward(ctx, t.TargetGroupID, filePath, t.FileName, fmt.Sprintf("来源: %s", t.SourceURL))
 }
 
 func (p *Pool) handleQQToStorage(ctx context.Context, t *repository.Task) error {
@@ -135,6 +153,7 @@ func (p *Pool) handleQQToStorage(ctx context.Context, t *repository.Task) error 
 	if err != nil {
 		return err
 	}
+	defer os.Remove(res.Path)
 	t.SHA256, t.FileSize = res.SHA256, res.Size
 	path, err := p.storage.PutFile(ctx, res.Path, t.FileName)
 	if err != nil {

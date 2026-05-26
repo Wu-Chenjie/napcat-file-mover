@@ -35,6 +35,7 @@ type Core struct {
 	napcat     *napcat.Client
 	gateway    *bot.Gateway
 	workers    *worker.Pool
+	storage    *storage.Local
 	server     *http.Server
 	wsListener *napcat.WSListener
 	sessions   map[string]time.Time
@@ -61,7 +62,8 @@ func New(cfg *config.Config) (*Core, error) {
 		cfg:      cfg,
 		repo:     repo,
 		napcat:   nc,
-		gateway:  bot.NewGateway(cfg, repo, nc),
+		gateway:  bot.NewGateway(cfg, repo, nc, st),
+		storage:  st,
 		workers:  pool,
 		sessions: map[string]time.Time{},
 		searches: map[string][]repository.SearchResult{},
@@ -98,10 +100,41 @@ func defaultWSURI(endpoint string) string {
 	return u.String()
 }
 
+func (c *Core) indexLocalFiles() {
+	if c.storage == nil {
+		return
+	}
+	files, err := c.storage.ListLocalFiles(context.Background())
+	if err != nil {
+		log.Printf("list local files: %v", err)
+		return
+	}
+	for _, f := range files {
+		idx := search.BuildIndexedText(f.Name)
+		if err := c.repo.IndexLocalFile(context.Background(), repository.FileCatalog{
+			GroupID:        0,
+			FileID:         f.SHA256,
+			BusID:          0,
+			FileName:       f.Name,
+			Ext:            strings.ToLower(filepath.Ext(f.Name)),
+			FileSize:       f.Size,
+			FolderPath:     f.Path,
+			NormalizedText: idx.Normalized,
+			Pinyin:         idx.Pinyin,
+			Initials:       idx.Initials,
+			NGrams:         idx.NGrams,
+		}); err != nil {
+			log.Printf("index local file %s: %v", f.Name, err)
+		}
+	}
+	log.Printf("indexed %d local files", len(files))
+}
+
 func (c *Core) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	c.routes(mux)
 	c.server = &http.Server{Addr: c.cfg.Server.Listen, Handler: corsMiddleware(mux)}
+	go c.indexLocalFiles()
 	c.workers.Start(ctx)
 	go func() {
 		if err := c.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

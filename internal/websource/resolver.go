@@ -142,7 +142,7 @@ func (r *Resolver) searchGitHubRepo(ctx context.Context, owner, repo, ref, query
 	query = strings.ToLower(query)
 	var out []File
 	for _, f := range files {
-		if strings.Contains(strings.ToLower(f.Name), query) {
+		if strings.Contains(strings.ToLower(f.Name), query) || strings.Contains(strings.ToLower(f.Path), query) {
 			out = append(out, f)
 		}
 	}
@@ -157,7 +157,7 @@ func (r *Resolver) searchFireworks(ctx context.Context, query string) ([]File, e
 	query = strings.ToLower(query)
 	var out []File
 	for _, f := range files {
-		if strings.Contains(strings.ToLower(f.Name), query) {
+		if strings.Contains(strings.ToLower(f.Name), query) || strings.Contains(strings.ToLower(f.Path), query) {
 			out = append(out, f)
 		}
 	}

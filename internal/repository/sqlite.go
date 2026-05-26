@@ -280,6 +280,24 @@ func (s *SQLite) UpsertCatalog(ctx context.Context, f FileCatalog) error {
 	return tx.Commit()
 }
 
+func (s *SQLite) IndexLocalFile(ctx context.Context, f FileCatalog) error {
+	f.GroupID = 0
+	f.BusID = 0
+	f.FileID = strings.TrimSpace(f.FileID)
+	if f.FileID == "" {
+		return nil
+	}
+	return s.UpsertCatalog(ctx, f)
+}
+
+func (s *SQLite) FindLocalByName(ctx context.Context, name string) (*FileCatalog, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, group_id, COALESCE(folder_id,''), COALESCE(folder_path,''), file_id, bus_id,
+		 file_name, COALESCE(ext,''), file_size, normalized_text, pinyin, initials, ngrams, updated_at
+		 FROM file_catalog WHERE group_id = 0 AND file_name = ? LIMIT 1`, name)
+	return scanCatalog(row)
+}
+
 func (s *SQLite) SearchFiles(ctx context.Context, query string, groupID int64, ext string, limit int) ([]SearchResult, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50

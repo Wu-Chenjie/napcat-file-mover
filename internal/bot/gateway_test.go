@@ -53,7 +53,7 @@ func TestHandleMoveScansCurrentGroupWhenCatalogMisses(t *testing.T) {
 	cfg.Search.MaxBatchFiles = 10
 	cfg.Search.MaxBatchSizeMB = 1024
 	nc := napcat.New(server.URL, "", 5*time.Second, 2)
-	gateway := NewGateway(cfg, repo, nc)
+	gateway := NewGateway(cfg, repo, nc, nil)
 
 	msg, err := gateway.handleMove(context.Background(), Command{
 		Name:    "搬运",
@@ -117,7 +117,7 @@ func TestHandleSearchScansAllowedGroupsWhenCatalogMisses(t *testing.T) {
 	cfg.Search.MaxBatchFiles = 10
 	cfg.Search.MaxBatchSizeMB = 1024
 	nc := napcat.New(server.URL, "", 5*time.Second, 4)
-	gateway := NewGateway(cfg, repo, nc)
+	gateway := NewGateway(cfg, repo, nc, nil)
 
 	msg, err := gateway.handleSearch(context.Background(), Command{
 		Name:    "搜索文件",
@@ -168,7 +168,7 @@ func TestHandleMoveScansAllowedGroupsWhenCatalogMisses(t *testing.T) {
 	cfg.Search.MaxBatchFiles = 10
 	cfg.Search.MaxBatchSizeMB = 1024
 	nc := napcat.New(server.URL, "", 5*time.Second, 4)
-	gateway := NewGateway(cfg, repo, nc)
+	gateway := NewGateway(cfg, repo, nc, nil)
 
 	msg, err := gateway.handleMove(context.Background(), Command{
 		Name:    "搬运",
@@ -230,7 +230,7 @@ func TestHandleMoveCurrentGroupMatchReturnsFileNameOnly(t *testing.T) {
 	cfg.Search.MaxBatchFiles = 10
 	cfg.Search.MaxBatchSizeMB = 1024
 	nc := napcat.New(server.URL, "", 5*time.Second, 4)
-	gateway := NewGateway(cfg, repo, nc)
+	gateway := NewGateway(cfg, repo, nc, nil)
 
 	msg, err := gateway.handleMove(context.Background(), Command{
 		Name:    "搬运",
@@ -293,7 +293,7 @@ func TestHandleHelpAllowedForNonAdmin(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Bot.AllowedGroups = []int64{10001}
 	nc := napcat.New(server.URL, "", 5*time.Second, 2)
-	gateway := NewGateway(cfg, nil, nc)
+	gateway := NewGateway(cfg, nil, nc, nil)
 
 	gateway.HandleEvent(context.Background(), napcat.OneBotEvent{
 		PostType:    "message",
@@ -325,7 +325,7 @@ func TestHandleWebSearchIncludesDownloadLinks(t *testing.T) {
 	}))
 	defer server.Close()
 
-	gateway := NewGateway(&config.Config{}, nil, nil)
+	gateway := NewGateway(&config.Config{}, nil, nil, nil)
 	gateway.resolver = websource.NewResolver(websource.Options{
 		HTTPClient:            server.Client(),
 		FireworksListEndpoint: server.URL + "/api/fs/list",
@@ -362,7 +362,7 @@ func TestSearchCatalogFindsChineseFilename(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gateway := NewGateway(&config.Config{}, repo, nil)
+	gateway := NewGateway(&config.Config{}, repo, nil, nil)
 	results, err := gateway.searchCatalog(context.Background(), "未来技术", 5)
 	if err != nil {
 		t.Fatal(err)
@@ -386,7 +386,7 @@ func TestHandleMoveURLDefaultsToCurrentGroupUpload(t *testing.T) {
 	cfg.Bot.AllowedGroups = []int64{10001}
 	cfg.Website.AllowedHosts = []string{"github.com"}
 	cfg.Worker.MaxRetries = 3
-	gateway := NewGateway(cfg, repo, nil)
+	gateway := NewGateway(cfg, repo, nil, nil)
 
 	msg, err := gateway.handleMove(context.Background(), Command{
 		Name:    "搬运",

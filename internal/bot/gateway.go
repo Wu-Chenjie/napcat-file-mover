@@ -16,6 +16,7 @@ import (
 	"napcat-file-mover/internal/repository"
 	"napcat-file-mover/internal/search"
 	"napcat-file-mover/internal/security"
+	"napcat-file-mover/internal/storage"
 	"napcat-file-mover/internal/websource"
 	"napcat-file-mover/internal/worker"
 )
@@ -37,6 +38,7 @@ type Gateway struct {
 	repo        *repository.SQLite
 	napcat      *napcat.Client
 	resolver    *websource.Resolver
+	storage     *storage.Local
 	botUserID   string
 	botNickname string
 }
@@ -51,7 +53,7 @@ type qqCandidate struct {
 	FileSize   int64
 }
 
-func NewGateway(cfg *config.Config, repo *repository.SQLite, nc *napcat.Client) *Gateway {
+func NewGateway(cfg *config.Config, repo *repository.SQLite, nc *napcat.Client, st *storage.Local) *Gateway {
 	return &Gateway{
 		cfg:      cfg,
 		repo:     repo,
@@ -422,10 +424,25 @@ func (g *Gateway) handleSearch(ctx context.Context, cmd Command) (string, error)
 	}
 	var b strings.Builder
 	b.WriteString("匹配文件:\n")
-	for i, r := range results {
-		fmt.Fprintf(&b, "%d. %s (%s, score %.2f)\n", i+1, r.FileName, formatSize(r.FileSize), r.Score)
-	}
+		for i, r := range results {
+			src := fmt.Sprintf(" [群%d]", r.GroupID)
+			if r.GroupID == 0 {
+				src = " [本地]"
+			}
+			fmt.Fprintf(&b, "%d. %s (%s, score %.2f)%s\n", i+1, r.FileName, formatSize(r.FileSize), r.Score, src)
+		}
 	return strings.TrimSpace(b.String()), nil
+}
+
+func (g *Gateway) findLocalMatch(ctx context.Context, name string) (string, bool) {
+	if g.storage == nil {
+		return "", false
+	}
+	cat, err := g.repo.FindLocalByName(ctx, name)
+	if err != nil || cat == nil {
+		return "", false
+	}
+	return cat.FolderPath, true
 }
 
 func (g *Gateway) handleTopicTransfer(ctx context.Context, cmd Command) (string, error) {
