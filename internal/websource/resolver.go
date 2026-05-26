@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,6 +35,7 @@ type Options struct {
 	GitHubAPIBase         string
 	GitHubRawBase         string
 	HOARawBase            string
+	HOAPageBase           string
 }
 
 type Resolver struct {
@@ -40,6 +45,7 @@ type Resolver struct {
 	githubAPIBase         string
 	githubRawBase         string
 	hoaRawBase            string
+	hoaPageBase           string
 }
 
 func NewResolver(opts Options) *Resolver {
@@ -54,6 +60,7 @@ func NewResolver(opts Options) *Resolver {
 		githubAPIBase:         strings.TrimRight(defaultString(opts.GitHubAPIBase, "https://api.github.com"), "/"),
 		githubRawBase:         strings.TrimRight(defaultString(opts.GitHubRawBase, "https://raw.githubusercontent.com"), "/"),
 		hoaRawBase:            strings.TrimRight(defaultString(opts.HOARawBase, "https://gh.hoa.moe/github.com"), "/"),
+		hoaPageBase:           strings.TrimRight(opts.HOAPageBase, "/"),
 	}
 }
 
@@ -67,6 +74,8 @@ func (r *Resolver) Resolve(ctx context.Context, rawURL string) ([]File, error) {
 		return r.resolveFireworks(ctx, u)
 	case "hoa.moe":
 		return r.resolveHOA(ctx, u)
+	case "gh.hoa.moe":
+		return r.resolveHOARaw(u)
 	case "github.com":
 		return r.resolveGitHub(ctx, u, false)
 	default:
@@ -79,20 +88,44 @@ var defaultRepos = []struct{ Owner, Repo, Ref string }{
 }
 
 func (r *Resolver) SearchWeb(ctx context.Context, query string, limit int) ([]File, error) {
-	var all []File
-
-	fwFiles, err := r.searchFireworks(ctx, query)
-	if err != nil {
-		log.Printf("fireworks search: %v", err)
+	type result struct {
+		files []File
+		err   error
+		name  string
 	}
-	all = append(all, fwFiles...)
-
+	jobs := []func(context.Context) result{
+		func(ctx context.Context) result {
+			files, err := r.searchFireworks(ctx, query)
+			return result{files: files, err: err, name: "fireworks"}
+		},
+	}
 	for _, repo := range defaultRepos {
-		ghFiles, err := r.searchGitHubRepo(ctx, repo.Owner, repo.Repo, repo.Ref, query, false)
-		if err != nil {
-			log.Printf("github search %s/%s: %v", repo.Owner, repo.Repo, err)
+		repo := repo
+		jobs = append(jobs, func(ctx context.Context) result {
+			files, err := r.searchGitHubRepo(ctx, repo.Owner, repo.Repo, repo.Ref, query, false)
+			return result{files: files, err: err, name: "github " + repo.Owner + "/" + repo.Repo}
+		})
+	}
+
+	results := make([]result, len(jobs))
+	var wg sync.WaitGroup
+	for i, job := range jobs {
+		i, job := i, job
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = job(ctx)
+		}()
+	}
+	wg.Wait()
+
+	var all []File
+	for _, result := range results {
+		if result.err != nil {
+			log.Printf("%s search: %v", result.name, result.err)
+			continue
 		}
-		all = append(all, ghFiles...)
+		all = append(all, result.files...)
 	}
 
 	if len(all) > limit {
@@ -175,25 +208,36 @@ func (r *Resolver) listFireworks(ctx context.Context, listPath, rel string) ([]F
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 || out.Code != 200 {
 		return nil, fmt.Errorf("fireworks list failed: http=%d code=%d %s", resp.StatusCode, out.Code, out.Message)
 	}
-	files := []File{}
-	for _, item := range out.Data.Content {
+	results := make([][]File, len(out.Data.Content))
+	errs := make([]error, len(out.Data.Content))
+	var wg sync.WaitGroup
+	for i, item := range out.Data.Content {
+		i, item := i, item
 		itemRel := path.Join(rel, item.Name)
 		if item.IsDir {
-			child, err := r.listFireworks(ctx, path.Join(listPath, item.Name), itemRel)
-			if err != nil {
-				return nil, err
-			}
-			files = append(files, child...)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results[i], errs[i] = r.listFireworks(ctx, path.Join(listPath, item.Name), itemRel)
+			}()
 			continue
 		}
 		modified, _ := time.Parse(time.RFC3339, item.Modified)
-		files = append(files, File{
+		results[i] = []File{{
 			Name:     item.Name,
 			Path:     itemRel,
 			URL:      r.fireworksDownloadBase + "/" + encodePath(itemRel),
 			Size:     item.Size,
 			Modified: modified,
-		})
+		}}
+	}
+	wg.Wait()
+	files := []File{}
+	for i, child := range results {
+		if errs[i] != nil {
+			return nil, errs[i]
+		}
+		files = append(files, child...)
 	}
 	return files, nil
 }
@@ -207,7 +251,118 @@ func (r *Resolver) resolveHOA(ctx context.Context, u *url.URL) ([]File, error) {
 	if repo == "" {
 		return nil, ErrUnsupported
 	}
-	return r.listGitHubTree(ctx, "HITSZ-OpenAuto", repo, "main", "", true)
+	files, err := r.listGitHubTree(ctx, "HITSZ-OpenAuto", repo, "main", "", true)
+	if err == nil && len(files) > 0 {
+		return files, nil
+	}
+	pageFiles, pageErr := r.fetchHOAPageFiles(ctx, u)
+	if pageErr == nil && len(pageFiles) > 0 {
+		return pageFiles, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+func (r *Resolver) resolveHOARaw(u *url.URL) ([]File, error) {
+	file, ok := fileFromHOARawURL(u.String())
+	if !ok {
+		return nil, ErrUnsupported
+	}
+	return []File{file}, nil
+}
+
+func (r *Resolver) fetchHOAPageFiles(ctx context.Context, u *url.URL) ([]File, error) {
+	pageURL := u.String()
+	if r.hoaPageBase != "" {
+		base, err := url.Parse(r.hoaPageBase)
+		if err != nil {
+			return nil, err
+		}
+		page := *u
+		page.Scheme = base.Scheme
+		page.Host = base.Host
+		pageURL = page.String()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "NapCatFileMover/0.1")
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("hoa page failed: %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, err
+	}
+	files := extractHOARawFiles(string(body))
+	if len(files) == 0 {
+		return nil, ErrUnsupported
+	}
+	return files, nil
+}
+
+var hoaRawURLPattern = regexp.MustCompile(`https://gh\.hoa\.moe/github\.com/[^"'\\<>\s]+`)
+
+func extractHOARawFiles(page string) []File {
+	decoded := html.UnescapeString(page)
+	decoded = strings.NewReplacer(
+		`\/`, `/`,
+		`\u002F`, `/`,
+		`\u002f`, `/`,
+		`\u0026`, `&`,
+	).Replace(decoded)
+	matches := hoaRawURLPattern.FindAllString(decoded, -1)
+	files := make([]File, 0, len(matches))
+	seen := map[string]bool{}
+	for _, match := range matches {
+		if seen[match] {
+			continue
+		}
+		file, ok := fileFromHOARawURL(match)
+		if !ok || !isLikelyDocument(file.Name) {
+			continue
+		}
+		seen[match] = true
+		files = append(files, file)
+	}
+	return files
+}
+
+func fileFromHOARawURL(rawURL string) (File, bool) {
+	u, err := url.Parse(rawURL)
+	if err != nil || strings.ToLower(u.Hostname()) != "gh.hoa.moe" {
+		return File{}, false
+	}
+	parts := cleanParts(u.Path)
+	if len(parts) < 6 || parts[0] != "github.com" || parts[3] != "raw" {
+		return File{}, false
+	}
+	filePath := strings.Join(parts[5:], "/")
+	if filePath == "" {
+		return File{}, false
+	}
+	return File{
+		Name: path.Base(filePath),
+		Path: filePath,
+		URL:  rawURL,
+	}, true
+}
+
+func isLikelyDocument(name string) bool {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".md", ".csv", ".zip", ".rar", ".7z", ".tar", ".gz":
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Resolver) resolveGitHub(ctx context.Context, u *url.URL, useHOARaw bool) ([]File, error) {

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"napcat-file-mover/internal/config"
 	"napcat-file-mover/internal/napcat"
@@ -358,7 +360,7 @@ func (g *Gateway) handleWebSearch(ctx context.Context, cmd Command) (string, err
 	var b strings.Builder
 	b.WriteString("网站匹配文件:\n")
 	for i, f := range files {
-		fmt.Fprintf(&b, "%d. %s (%s)\n", i+1, f.Name, formatSize(f.Size))
+		fmt.Fprintf(&b, "%d. %s (%s)\n%s\n", i+1, f.Name, formatSize(f.Size), f.URL)
 	}
 	return strings.TrimSpace(b.String()), nil
 }
@@ -411,18 +413,9 @@ func (g *Gateway) handleSearch(ctx context.Context, cmd Command) (string, error)
 		return "", fmt.Errorf("用法: /搜索文件 <关键词>")
 	}
 	q := strings.Join(cmd.Args, " ")
-	results, err := g.searchCatalog(ctx, q, 15)
+	results, err := g.findFiles(ctx, q, 15)
 	if err != nil {
 		return "", err
-	}
-	if len(results) == 0 {
-		if _, err := g.scanGroupFiles(ctx, cmd.GroupID); err != nil {
-			return "", err
-		}
-		results, err = g.searchCatalog(ctx, q, 15)
-		if err != nil {
-			return "", err
-		}
 	}
 	if len(results) == 0 {
 		return "没有匹配文件", nil
@@ -486,16 +479,21 @@ func (g *Gateway) moveByName(ctx context.Context, cmd Command, query, target str
 		targetGroup = v
 		targetType = "qq"
 	}
-	results, err := g.searchCatalog(ctx, query, g.cfg.Search.MaxBatchFiles)
+	results, err := g.findFiles(ctx, query, g.cfg.Search.MaxBatchFiles)
 	if err != nil {
 		return "", err
 	}
 	created := 0
+	local := []string{}
 	total := int64(0)
 	for _, r := range results {
 		total += r.FileSize
 		if g.cfg.Search.MaxBatchSizeMB > 0 && total > g.cfg.Search.MaxBatchSizeMB*1024*1024 {
 			break
+		}
+		if targetType == "qq" && targetGroup == cmd.GroupID && r.GroupID == cmd.GroupID {
+			local = append(local, r.FileName)
+			continue
 		}
 		nt := &repository.Task{
 			TaskType: repository.TaskQQToStorage, SourceType: "qq", SourceGroupID: r.GroupID,
@@ -517,45 +515,28 @@ func (g *Gateway) moveByName(ctx context.Context, cmd Command, query, target str
 		}
 	}
 	if created == 0 {
-		candidates, err := g.scanGroupFiles(ctx, cmd.GroupID)
-		if err != nil {
-			return "", err
+		if len(local) > 0 {
+			return formatLocalMatches(local), nil
 		}
-		for _, candidate := range candidates {
-			if !g.matchesQuery(candidate, query) {
-				continue
-			}
-			if !isDocFile(candidate.FileName) {
-				continue
-			}
-			total += candidate.FileSize
-			if g.cfg.Search.MaxBatchSizeMB > 0 && total > g.cfg.Search.MaxBatchSizeMB*1024*1024 {
-				break
-			}
-			nt := &repository.Task{
-				TaskType: repository.TaskQQToStorage, SourceType: "qq", SourceGroupID: candidate.GroupID,
-				SourceFileID: candidate.FileID, SourceBusID: candidate.BusID, SourceFolderID: candidate.FolderID,
-				TargetType: targetType, TargetGroupID: targetGroup,
-				FileName: candidate.FileName, FileSize: candidate.FileSize,
-				IdempotencyKey: worker.Idempotency("move-live", query, strconv.FormatInt(candidate.GroupID, 10), candidate.FileID, target),
-				MaxRetries:     g.cfg.Worker.MaxRetries, CreatedBy: cmd.UserID,
-			}
-			if targetType == "qq" {
-				nt.TaskType = repository.TaskQQToQQ
-			}
-			id, err := g.repo.CreateTask(ctx, nt)
-			if err != nil {
-				return "", err
-			}
-			if id != 0 {
-				created++
-			}
-		}
-	}
-	if created == 0 {
 		return "没有匹配资料文件", nil
 	}
+	if len(local) > 0 {
+		return fmt.Sprintf("%s\n已创建 %d 个搬运任务", formatLocalMatches(local), created), nil
+	}
 	return fmt.Sprintf("已创建 %d 个搬运任务", created), nil
+}
+
+func formatLocalMatches(names []string) string {
+	var b strings.Builder
+	b.WriteString("文件已在当前群:\n")
+	for i, name := range names {
+		if i >= 20 {
+			fmt.Fprintf(&b, "... 还有 %d 个文件", len(names)-i)
+			break
+		}
+		fmt.Fprintf(&b, "%d. %s\n", i+1, name)
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func (g *Gateway) handleStatus(ctx context.Context, cmd Command) (string, error) {
@@ -591,6 +572,8 @@ func truncateStr(s string, n int) string {
 	return s[:n] + "..."
 }
 
+const maxChunkSize = 3000
+
 func (g *Gateway) reply(ctx context.Context, groupID int64, msg string) {
 	if msg == "" {
 		return
@@ -606,17 +589,58 @@ func (g *Gateway) reply(ctx context.Context, groupID int64, msg string) {
 			g.botNickname = info.Nickname
 		}
 	}
-	nodes := []napcat.ForwardNode{{
-		UserID:   g.botUserID,
-		Nickname: g.botNickname,
-		Content:  []napcat.MessageSegment{{Type: "text", Data: map[string]any{"text": msg}}},
-	}}
-	if err := g.napcat.SendGroupForwardMsg(ctx, groupID, nodes); err != nil {
-		log.Printf("[reply] error: %v", err)
+	nodes := buildForwardNodes(g.botUserID, g.botNickname, msg)
+	log.Printf("[reply] sending %d chunks", len(nodes))
+	for i, node := range nodes {
+		if err := g.napcat.SendGroupForwardMsg(ctx, groupID, []napcat.ForwardNode{node}); err != nil {
+			log.Printf("[reply] chunk %d/%d error: %v", i+1, len(nodes), err)
+		}
+		if len(nodes) > 1 && i < len(nodes)-1 {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 }
 
+func buildForwardNodes(userID, nickname, msg string) []napcat.ForwardNode {
+	if len(msg) <= maxChunkSize {
+		return []napcat.ForwardNode{{UserID: userID, Nickname: nickname, Content: []napcat.MessageSegment{{Type: "text", Data: map[string]any{"text": msg}}}}}
+	}
+	chunks := splitMessage(msg, maxChunkSize)
+	nodes := make([]napcat.ForwardNode, len(chunks))
+	for i, chunk := range chunks {
+		nodes[i] = napcat.ForwardNode{
+			UserID:   userID,
+			Nickname: nickname,
+			Content:  []napcat.MessageSegment{{Type: "text", Data: map[string]any{"text": chunk}}},
+		}
+	}
+	return nodes
+}
+
+func splitMessage(msg string, size int) []string {
+	var chunks []string
+	lines := strings.Split(msg, "\n")
+	var buf strings.Builder
+	for _, line := range lines {
+		if buf.Len()+len(line)+1 > size && buf.Len() > 0 {
+			chunks = append(chunks, buf.String())
+			buf.Reset()
+		}
+		if buf.Len() > 0 {
+			buf.WriteByte('\n')
+		}
+		buf.WriteString(line)
+	}
+	if buf.Len() > 0 {
+		chunks = append(chunks, buf.String())
+	}
+	return chunks
+}
+
 func (g *Gateway) searchCatalog(ctx context.Context, query string, limit int) ([]repository.SearchResult, error) {
+	if limit <= 0 {
+		limit = 20
+	}
 	indexed := search.BuildIndexedText(query)
 	queries := []string{indexed.Normalized, indexed.Pinyin, indexed.Initials, indexed.NGrams}
 	out := make([]repository.SearchResult, 0, limit)
@@ -643,6 +667,104 @@ func (g *Gateway) searchCatalog(ctx context.Context, query string, limit int) ([
 		}
 	}
 	return out, nil
+}
+
+func (g *Gateway) findFiles(ctx context.Context, query string, limit int) ([]repository.SearchResult, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	results, err := g.searchCatalog(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) > 0 {
+		return results, nil
+	}
+	candidates, err := g.scanAllowedGroupFiles(ctx)
+	if err != nil {
+		return nil, err
+	}
+	results, err = g.searchCatalog(ctx, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) > 0 {
+		return results, nil
+	}
+	return g.candidatesToResults(query, candidates, limit), nil
+}
+
+func (g *Gateway) candidatesToResults(query string, candidates []qqCandidate, limit int) []repository.SearchResult {
+	out := make([]repository.SearchResult, 0, limit)
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		if !isDocFile(candidate.FileName) || !g.matchesQuery(candidate, query) {
+			continue
+		}
+		key := fmt.Sprintf("%d:%s:%d", candidate.GroupID, candidate.FileName, candidate.FileSize)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, repository.SearchResult{
+			FileCatalog: repository.FileCatalog{
+				GroupID: candidate.GroupID, FolderID: candidate.FolderID, FolderPath: candidate.FolderPath,
+				FileID: candidate.FileID, BusID: candidate.BusID, FileName: candidate.FileName,
+				Ext: strings.ToLower(filepath.Ext(candidate.FileName)), FileSize: candidate.FileSize,
+			},
+			Score:  0.60,
+			Reason: "live-scan",
+		})
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func (g *Gateway) scanAllowedGroupFiles(ctx context.Context) ([]qqCandidate, error) {
+	groups := g.cfg.Bot.AllowedGroups
+	if len(groups) == 0 {
+		return nil, nil
+	}
+	workers := g.cfg.NapCat.MaxConcurrentRequests
+	if workers <= 0 {
+		workers = 4
+	}
+	if workers > len(groups) {
+		workers = len(groups)
+	}
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var all []qqCandidate
+	var errs []string
+	for _, groupID := range groups {
+		groupID := groupID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
+			files, err := g.scanGroupFiles(ctx, groupID)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("%d: %v", groupID, err))
+				return
+			}
+			all = append(all, files...)
+		}()
+	}
+	wg.Wait()
+	if len(all) == 0 && len(errs) > 0 {
+		return nil, fmt.Errorf("扫描群文件失败: %s", strings.Join(errs, "; "))
+	}
+	return all, nil
 }
 
 func (g *Gateway) scanGroupFiles(ctx context.Context, groupID int64) ([]qqCandidate, error) {

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestResolveFireworksDirectoryURL(t *testing.T) {
@@ -111,5 +113,153 @@ func TestResolveHOACourseURL(t *testing.T) {
 	wantURL := "https://gh.hoa.moe/github.com/HITSZ-OpenAuto/PHYS1002/raw/main/Exp01/%E6%8A%A5%E5%91%8A.pdf"
 	if files[0].URL != wantURL {
 		t.Fatalf("unexpected HOA raw URL:\nwant %s\n got %s", wantURL, files[0].URL)
+	}
+}
+
+func TestResolveHOACourseURLFallsBackToPageRawLinks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		switch r.URL.Path {
+		case "/repos/HITSZ-OpenAuto/PHYS1002/git/trees/main":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"rate limited"}`))
+		case "/docs/2025/25L51/fresh-spring/PHYS1002":
+			_, _ = w.Write([]byte(`<!doctype html><script>
+				self.__next_f.push(["files",{"url":"https://gh.hoa.moe/github.com/HITSZ-OpenAuto/PHYS1002/raw/main/Exp01/%E6%8A%A5%E5%91%8A.pdf"},
+				{"url":"https:\/\/gh.hoa.moe\/github.com\/HITSZ-OpenAuto\/PHYS1002\/raw\/main\/Exp02\/%E8%AE%B2%E4%B9%89.pdf"},
+				{"url":"https://gh.hoa.moe/github.com/HITSZ-OpenAuto/PHYS1002/raw/main/.github/workflows/trigger-workflow.yml"}])
+			</script>`))
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	resolver := NewResolver(Options{
+		HTTPClient:    server.Client(),
+		GitHubAPIBase: server.URL,
+		HOAPageBase:   server.URL,
+	})
+	files, err := resolver.Resolve(context.Background(), "https://hoa.moe/docs/2025/25L51/fresh-spring/PHYS1002")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files, got %d: %#v", len(files), files)
+	}
+	if files[0].Name != "报告.pdf" || files[0].Path != "Exp01/报告.pdf" {
+		t.Fatalf("unexpected first file: %#v", files[0])
+	}
+	if files[1].Name != "讲义.pdf" || files[1].Path != "Exp02/讲义.pdf" {
+		t.Fatalf("unexpected second file: %#v", files[1])
+	}
+}
+
+func TestResolveHOARawURL(t *testing.T) {
+	resolver := NewResolver(Options{})
+	files, err := resolver.Resolve(context.Background(), "https://gh.hoa.moe/github.com/HITSZ-OpenAuto/PHYS1002/raw/main/Exp01/%E6%8A%A5%E5%91%8A.pdf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %d: %#v", len(files), files)
+	}
+	if files[0].Name != "报告.pdf" {
+		t.Fatalf("unexpected file: %#v", files[0])
+	}
+	if files[0].URL != "https://gh.hoa.moe/github.com/HITSZ-OpenAuto/PHYS1002/raw/main/Exp01/%E6%8A%A5%E5%91%8A.pdf" {
+		t.Fatalf("unexpected url: %s", files[0].URL)
+	}
+}
+
+func TestSearchWebQueriesSourcesConcurrently(t *testing.T) {
+	var active int32
+	var maxActive int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		now := atomic.AddInt32(&active, 1)
+		for {
+			old := atomic.LoadInt32(&maxActive)
+			if now <= old || atomic.CompareAndSwapInt32(&maxActive, old, now) {
+				break
+			}
+		}
+		time.Sleep(80 * time.Millisecond)
+		defer atomic.AddInt32(&active, -1)
+
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/fs/list":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"content":[{"name":"match-fireworks.pdf","is_dir":false,"size":10,"modified":"2026-01-02T03:04:05+08:00"}]}}`))
+		case "/repos/HITLittleZheng/HITCS/git/trees/main":
+			_, _ = w.Write([]byte(`{"tree":[{"path":"match-github.pdf","type":"blob","size":20}]}`))
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	resolver := NewResolver(Options{
+		HTTPClient:            server.Client(),
+		FireworksListEndpoint: server.URL + "/api/fs/list",
+		FireworksDownloadBase: "https://olist-eo.jwyihao.top/d/Fireworks",
+		GitHubAPIBase:         server.URL,
+	})
+	files, err := resolver.SearchWeb(context.Background(), "match", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files, got %d: %#v", len(files), files)
+	}
+	if atomic.LoadInt32(&maxActive) < 2 {
+		t.Fatalf("expected concurrent web source requests, max active=%d", maxActive)
+	}
+}
+
+func TestResolveFireworksSubdirectoriesConcurrently(t *testing.T) {
+	var activeChildren int32
+	var maxChildren int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Path string `json:"path"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Path {
+		case "/Fireworks":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"content":[{"name":"A","is_dir":true,"size":0,"modified":"2026-01-02T03:04:05+08:00"},{"name":"B","is_dir":true,"size":0,"modified":"2026-01-02T03:04:05+08:00"}]}}`))
+		case "/Fireworks/A", "/Fireworks/B":
+			now := atomic.AddInt32(&activeChildren, 1)
+			for {
+				old := atomic.LoadInt32(&maxChildren)
+				if now <= old || atomic.CompareAndSwapInt32(&maxChildren, old, now) {
+					break
+				}
+			}
+			time.Sleep(80 * time.Millisecond)
+			defer atomic.AddInt32(&activeChildren, -1)
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"content":[{"name":"child.pdf","is_dir":false,"size":10,"modified":"2026-01-02T03:04:05+08:00"}]}}`))
+		default:
+			t.Fatalf("unexpected list path: %s", req.Path)
+		}
+	}))
+	defer server.Close()
+
+	resolver := NewResolver(Options{
+		HTTPClient:            server.Client(),
+		FireworksListEndpoint: server.URL + "/api/fs/list",
+		FireworksDownloadBase: "https://olist-eo.jwyihao.top/d/Fireworks",
+	})
+	files, err := resolver.Resolve(context.Background(), "https://fireworks.jwyihao.top/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files, got %d: %#v", len(files), files)
+	}
+	if atomic.LoadInt32(&maxChildren) < 2 {
+		t.Fatalf("expected concurrent fireworks child requests, max active=%d", maxChildren)
 	}
 }
