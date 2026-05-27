@@ -11,6 +11,7 @@
   let notice = '';
   let active = 'tasks';
   let settings = null;
+  let runtime = null;
   let adminsText = '';
   let groupsText = '';
   let hostsText = '';
@@ -36,6 +37,7 @@
       authed = true;
       await loadTasks();
       await loadSettings();
+      await loadRuntime();
       connectEvents();
     } catch (err) {
       error = err.message;
@@ -78,6 +80,19 @@
     newNapCatToken = '';
   }
 
+  async function loadRuntime() {
+    runtime = await api('/api/runtime/status');
+  }
+
+  async function reloadConfig() {
+    error = '';
+    notice = '';
+    const data = await api('/api/config/reload', { method: 'POST', body: '{}' });
+    settings = data.config;
+    await loadRuntime();
+    notice = data.restart_required ? '配置已热重载，部分后端变更需要重启。' : '配置已热重载。';
+  }
+
   async function saveSettings() {
     error = '';
     notice = '';
@@ -92,6 +107,7 @@
       body: JSON.stringify(payload)
     });
     settings = data.config;
+    await loadRuntime();
     newAdminToken = '';
     newNapCatToken = '';
     notice = data.restart_required ? '配置已保存，重启服务后完全生效。' : '配置已保存。';
@@ -136,6 +152,7 @@
       <h1>File Mover</h1>
       <button class:active={active === 'tasks'} on:click={() => active = 'tasks'}>任务</button>
       <button class:active={active === 'search'} on:click={() => active = 'search'}>搜索</button>
+      <button class:active={active === 'runtime'} on:click={() => { active = 'runtime'; loadRuntime(); }}>运行状态</button>
       <button class:active={active === 'settings'} on:click={() => active = 'settings'}>设置</button>
       <button on:click={loadTasks}>刷新任务</button>
       <select bind:value={status} on:change={loadTasks}>
@@ -171,9 +188,25 @@
                 <span>{row.group_id}</span>
                 <span>{formatSize(row.file_size)}</span>
                 <span>{row.score.toFixed(2)}</span>
-                <span>{row.reason}</span>
+                <span>{row.matched_by || row.reason}</span>
               </div>
             {/each}
+          </div>
+        </section>
+      {:else if active === 'runtime' && runtime}
+        <section class="panel settings">
+          <h2>运行状态</h2>
+          <div class="runtime-grid">
+            <div><strong>数据库</strong><span>{runtime.database.driver}</span></div>
+            <div><strong>队列</strong><span>{runtime.queue.type}</span></div>
+            <div><strong>存储</strong><span>{runtime.storage.type}</span></div>
+            <div><strong>语义搜索</strong><span>{runtime.semantic_search.enabled ? `${runtime.semantic_search.provider}/${runtime.semantic_search.model}` : 'disabled'}</span></div>
+            <div><strong>语义索引</strong><span>{runtime.semantic_search.ready ? 'ready' : (runtime.semantic_search.error || 'not ready')}</span></div>
+            <div><strong>热重载</strong><span>{runtime.reload.enabled ? (runtime.reload.restart_required ? '需重启' : '已启用') : 'disabled'}</span></div>
+          </div>
+          <div class="settings-actions">
+            <button on:click={loadRuntime}>刷新状态</button>
+            <button on:click={reloadConfig}>手动热重载</button>
           </div>
         </section>
       {:else if active === 'settings' && settings}
@@ -187,7 +220,17 @@
             <label>NapCat 超时秒<input bind:value={settings.napcat.timeout_seconds} type="number" min="1" /></label>
             <label>NapCat 并发<input bind:value={settings.napcat.max_concurrent_requests} type="number" min="1" /></label>
             <label>最大文件 MB<input bind:value={settings.website.max_file_size_mb} type="number" min="1" /></label>
+            <label>数据库驱动<select bind:value={settings.database.driver}><option value="sqlite">sqlite</option><option value="postgres">postgres</option></select></label>
+            <label>Postgres DSN<input bind:value={settings.database.dsn} /></label>
+            <label>Redis 启用<select bind:value={settings.redis.enabled}><option value={false}>false</option><option value={true}>true</option></select></label>
+            <label>Redis 地址<input bind:value={settings.redis.addr} /></label>
+            <label>存储类型<select bind:value={settings.storage.type}><option value="local">local</option><option value="s3">s3</option></select></label>
             <label>本地存储目录<input bind:value={settings.storage.local_root} /></label>
+            <label>S3 Endpoint<input bind:value={settings.storage.s3.endpoint} /></label>
+            <label>S3 Bucket<input bind:value={settings.storage.s3.bucket} /></label>
+            <label>S3 Region<input bind:value={settings.storage.s3.region} /></label>
+            <label>S3 Access Key<input bind:value={settings.storage.s3.access_key} /></label>
+            <label>S3 Secret Key<input bind:value={settings.storage.s3.secret_key} type="password" placeholder={settings.storage.s3.secret_key_set ? '已设置，留空不修改' : '未设置'} /></label>
             <label>下载 Worker<input bind:value={settings.worker.download_workers} type="number" min="1" /></label>
             <label>最大活跃任务<input bind:value={settings.worker.max_active_tasks} type="number" min="1" /></label>
             <label>Buffer KB<input bind:value={settings.worker.buffer_size_kb} type="number" min="64" /></label>
@@ -196,6 +239,9 @@
             <label>单批文件数<input bind:value={settings.search.max_batch_files} type="number" min="1" /></label>
             <label>单批总大小 MB<input bind:value={settings.search.max_batch_size_mb} type="number" min="1" /></label>
             <label>Embedding Endpoint<input bind:value={settings.search.embedding_endpoint} /></label>
+            <label>语义搜索<select bind:value={settings.search.semantic.enabled}><option value={false}>false</option><option value={true}>true</option></select></label>
+            <label>Ollama Endpoint<input bind:value={settings.search.semantic.endpoint} /></label>
+            <label>Embedding 模型<input bind:value={settings.search.semantic.model} /></label>
             <label class="wide">管理员 QQ<textarea bind:value={adminsText} rows="5"></textarea></label>
             <label class="wide">允许群号<textarea bind:value={groupsText} rows="5"></textarea></label>
             <label class="wide">允许网站域名<textarea bind:value={hostsText} rows="5"></textarea></label>
@@ -203,6 +249,7 @@
           <div class="settings-actions">
             <button on:click={loadSettings}>重新读取</button>
             <button on:click={saveSettings}>保存配置</button>
+            <button on:click={reloadConfig}>热重载</button>
           </div>
           <dl class="paths">
             <dt>配置</dt><dd>{settings.paths.Config}</dd>
