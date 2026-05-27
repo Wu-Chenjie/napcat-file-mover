@@ -20,10 +20,12 @@ type Config struct {
 	Bot       BotConfig       `yaml:"bot"`
 	Website   WebsiteConfig   `yaml:"website"`
 	Database  DatabaseConfig  `yaml:"database"`
+	Redis     RedisConfig     `yaml:"redis"`
 	Storage   StorageConfig   `yaml:"storage"`
 	Worker    WorkerConfig    `yaml:"worker"`
 	RateLimit RateLimitConfig `yaml:"rate_limit"`
 	Search    SearchConfig    `yaml:"search"`
+	Reload    ReloadConfig    `yaml:"reload"`
 	Paths     Paths           `yaml:"-"`
 }
 
@@ -57,11 +59,35 @@ type WebsiteConfig struct {
 }
 
 type DatabaseConfig struct {
-	Path string `yaml:"path"`
+	Driver string `yaml:"driver"`
+	Path   string `yaml:"path"`
+	DSN    string `yaml:"dsn"`
+}
+
+type RedisConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	Addr          string `yaml:"addr"`
+	Password      string `yaml:"password"`
+	DB            int    `yaml:"db"`
+	Stream        string `yaml:"stream"`
+	ConsumerGroup string `yaml:"consumer_group"`
+	ConsumerName  string `yaml:"consumer_name"`
 }
 
 type StorageConfig struct {
-	LocalRoot string `yaml:"local_root"`
+	Type      string          `yaml:"type"`
+	LocalRoot string          `yaml:"local_root"`
+	S3        S3StorageConfig `yaml:"s3"`
+}
+
+type S3StorageConfig struct {
+	Endpoint     string `yaml:"endpoint"`
+	Bucket       string `yaml:"bucket"`
+	Region       string `yaml:"region"`
+	AccessKey    string `yaml:"access_key"`
+	SecretKey    string `yaml:"secret_key"`
+	UsePathStyle bool   `yaml:"use_path_style"`
+	Prefix       string `yaml:"prefix"`
 }
 
 type WorkerConfig struct {
@@ -80,10 +106,25 @@ type RateLimitConfig struct {
 }
 
 type SearchConfig struct {
-	EmbeddingEndpoint string  `yaml:"embedding_endpoint"`
-	HighConfidence    float64 `yaml:"high_confidence"`
-	MaxBatchFiles     int     `yaml:"max_batch_files"`
-	MaxBatchSizeMB    int64   `yaml:"max_batch_size_mb"`
+	EmbeddingEndpoint string               `yaml:"embedding_endpoint"`
+	HighConfidence    float64              `yaml:"high_confidence"`
+	MaxBatchFiles     int                  `yaml:"max_batch_files"`
+	MaxBatchSizeMB    int64                `yaml:"max_batch_size_mb"`
+	Semantic          SemanticSearchConfig `yaml:"semantic"`
+}
+
+type SemanticSearchConfig struct {
+	Enabled        bool   `yaml:"enabled"`
+	Provider       string `yaml:"provider"`
+	Endpoint       string `yaml:"endpoint"`
+	Model          string `yaml:"model"`
+	BatchSize      int    `yaml:"batch_size"`
+	TimeoutSeconds int    `yaml:"timeout_seconds"`
+}
+
+type ReloadConfig struct {
+	Enabled    bool `yaml:"enabled"`
+	DebounceMS int  `yaml:"debounce_ms"`
 }
 
 type Paths struct {
@@ -164,8 +205,18 @@ func Default(paths Paths) *Config {
 			MaxFileSizeMB: 2048,
 			UserAgent:     "NapCatFileMover/0.1",
 		},
-		Database: DatabaseConfig{Path: paths.Database},
-		Storage:  StorageConfig{LocalRoot: paths.FilesDir},
+		Database: DatabaseConfig{Driver: "sqlite", Path: paths.Database},
+		Redis: RedisConfig{
+			Addr:          "127.0.0.1:6379",
+			Stream:        "mover:tasks",
+			ConsumerGroup: "mover-workers",
+			ConsumerName:  "mover-1",
+		},
+		Storage: StorageConfig{
+			Type:      "local",
+			LocalRoot: paths.FilesDir,
+			S3:        S3StorageConfig{Region: "us-east-1"},
+		},
 		Worker: WorkerConfig{
 			DownloadWorkers: 16,
 			UploadWorkers:   4,
@@ -183,6 +234,17 @@ func Default(paths Paths) *Config {
 			HighConfidence: 0.72,
 			MaxBatchFiles:  50,
 			MaxBatchSizeMB: 2048,
+			Semantic: SemanticSearchConfig{
+				Provider:       "ollama",
+				Endpoint:       "http://127.0.0.1:11434",
+				Model:          "bge-m3",
+				BatchSize:      16,
+				TimeoutSeconds: 30,
+			},
+		},
+		Reload: ReloadConfig{
+			Enabled:    true,
+			DebounceMS: 500,
 		},
 		Paths: paths,
 	}
@@ -244,10 +306,49 @@ func applyPathDefaults(cfg *Config) {
 	if cfg.Database.Path == "" {
 		cfg.Database.Path = cfg.Paths.Database
 	}
+	if cfg.Database.Driver == "" {
+		cfg.Database.Driver = "sqlite"
+	}
+	if cfg.Redis.Addr == "" {
+		cfg.Redis.Addr = "127.0.0.1:6379"
+	}
+	if cfg.Redis.Stream == "" {
+		cfg.Redis.Stream = "mover:tasks"
+	}
+	if cfg.Redis.ConsumerGroup == "" {
+		cfg.Redis.ConsumerGroup = "mover-workers"
+	}
+	if cfg.Redis.ConsumerName == "" {
+		cfg.Redis.ConsumerName = "mover-1"
+	}
+	if cfg.Storage.Type == "" {
+		cfg.Storage.Type = "local"
+	}
 	if cfg.Storage.LocalRoot == "" {
 		cfg.Storage.LocalRoot = cfg.Paths.FilesDir
 	}
+	if cfg.Storage.S3.Region == "" {
+		cfg.Storage.S3.Region = "us-east-1"
+	}
 	if cfg.Server.Listen == "" {
 		cfg.Server.Listen = "127.0.0.1:8088"
+	}
+	if cfg.Search.Semantic.Provider == "" {
+		cfg.Search.Semantic.Provider = "ollama"
+	}
+	if cfg.Search.Semantic.Endpoint == "" {
+		cfg.Search.Semantic.Endpoint = "http://127.0.0.1:11434"
+	}
+	if cfg.Search.Semantic.Model == "" {
+		cfg.Search.Semantic.Model = "bge-m3"
+	}
+	if cfg.Search.Semantic.BatchSize <= 0 {
+		cfg.Search.Semantic.BatchSize = 16
+	}
+	if cfg.Search.Semantic.TimeoutSeconds <= 0 {
+		cfg.Search.Semantic.TimeoutSeconds = 30
+	}
+	if cfg.Reload.DebounceMS <= 0 {
+		cfg.Reload.DebounceMS = 500
 	}
 }

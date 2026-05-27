@@ -3,6 +3,8 @@
 /mover.exe
 /napcat-file-mover
 *.test
+*.out
+*.coverprofile
 
 # Frontend
 /frontend/node_modules/
@@ -18,9 +20,31 @@ mover.exe~
 
 # OS/editor
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# IDE / workflow tooling
+.spec-workflow/
+
+# Build output
 /dist/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Database
+*.db
+*.db-shm
+*.db-wal
 
 # Logs and temp
 *.log
 .gocache/
 .gocache-test/
+tmp/

@@ -15,21 +15,39 @@ bot:
   admins:
     - 123456789
   allowed_groups:
-    - 111111111
+    - 11111111111
 
 website:
   allowed_hosts:
-    - "fireworks.jwyihao.top"
-    - "hoa.moe"
-    - "github.com"
+    - "you_url"
   max_file_size_mb: 2048
   user_agent: "NapCatFileMover/0.1"
 
 database:
+  driver: "sqlite"
   path: ""
+  dsn: ""
+
+redis:
+  enabled: false
+  addr: "127.0.0.1:6379"
+  password: ""
+  db: 0
+  stream: "mover:tasks"
+  consumer_group: "mover-workers"
+  consumer_name: "mover-1"
 
 storage:
+  type: "local"
   local_root: ""
+  s3:
+    endpoint: ""
+    bucket: ""
+    region: "us-east-1"
+    access_key: ""
+    secret_key: ""
+    use_path_style: true
+    prefix: "archive/"
 
 worker:
   download_workers: 16
@@ -49,3 +67,14 @@ search:
   high_confidence: 0.72
   max_batch_files: 50
   max_batch_size_mb: 2048
+  semantic:
+    enabled: false
+    provider: "ollama"
+    endpoint: "http://127.0.0.1:11434"
+    model: "bge-m3"
+    batch_size: 16
+    timeout_seconds: 30
+
+reload:
+  enabled: true
+  debounce_ms: 500

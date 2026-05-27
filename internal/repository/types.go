@@ -1,6 +1,9 @@
 package repository
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 type TaskType string
 
@@ -69,13 +72,17 @@ type FileCatalog struct {
 	Pinyin         string    `json:"pinyin"`
 	Initials       string    `json:"initials"`
 	NGrams         string    `json:"ngrams"`
+	EmbeddingJSON  string    `json:"embedding_json,omitempty"`
 	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type SearchResult struct {
 	FileCatalog
-	Score  float64 `json:"score"`
-	Reason string  `json:"reason"`
+	Score         float64 `json:"score"`
+	TextScore     float64 `json:"text_score,omitempty"`
+	SemanticScore float64 `json:"semantic_score,omitempty"`
+	MatchedBy     string  `json:"matched_by,omitempty"`
+	Reason        string  `json:"reason"`
 }
 
 type TaskFilter struct {
@@ -85,4 +92,25 @@ type TaskFilter struct {
 	Limit   int
 	Offset  int
 	GroupID int64
+}
+
+type Store interface {
+	Close() error
+	CreateTask(ctx context.Context, t *Task) (int64, error)
+	ClaimNext(ctx context.Context) (*Task, error)
+	ClaimTask(ctx context.Context, id int64) (*Task, error)
+	GetTask(ctx context.Context, id int64) (*Task, error)
+	ListTasks(ctx context.Context, f TaskFilter) ([]Task, error)
+	SetTaskStatus(ctx context.Context, id int64, status TaskStatus, lastError string) error
+	MarkDone(ctx context.Context, t *Task) error
+	MarkFailedOrRetry(ctx context.Context, t *Task, cause error) error
+	RetryTask(ctx context.Context, id int64) error
+	UpsertCatalog(ctx context.Context, f FileCatalog) error
+	IndexLocalFile(ctx context.Context, f FileCatalog) error
+	FindLocalByName(ctx context.Context, name string) (*FileCatalog, error)
+	SearchFiles(ctx context.Context, query string, groupID int64, ext string, limit int) ([]SearchResult, error)
+	ListCatalog(ctx context.Context, limit int) ([]FileCatalog, error)
+	UpdateCatalogEmbedding(ctx context.Context, id int64, embeddingJSON string) error
+	PendingTaskIDs(ctx context.Context, limit int) ([]int64, error)
+	Audit(ctx context.Context, operatorQQ, groupID int64, command, action, result, ip string)
 }

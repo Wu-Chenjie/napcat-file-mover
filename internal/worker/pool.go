@@ -14,6 +14,7 @@ import (
 	"napcat-file-mover/internal/config"
 	"napcat-file-mover/internal/downloader"
 	"napcat-file-mover/internal/napcat"
+	"napcat-file-mover/internal/queue"
 	"napcat-file-mover/internal/repository"
 	"napcat-file-mover/internal/security"
 	"napcat-file-mover/internal/storage"
@@ -21,19 +22,36 @@ import (
 
 type Pool struct {
 	cfg        *config.Config
-	repo       *repository.SQLite
+	repo       repository.Store
 	napcat     *napcat.Client
 	downloader *downloader.HTTPDownloader
-	storage    *storage.Local
+	storage    storage.Storage
+	queue      *queue.RedisStream
 	limiter    *SemaphoreLimiter
 	cancel     context.CancelFunc
 }
 
-func New(cfg *config.Config, repo *repository.SQLite, nc *napcat.Client, dl *downloader.HTTPDownloader, st *storage.Local) *Pool {
+func New(cfg *config.Config, repo repository.Store, nc *napcat.Client, dl *downloader.HTTPDownloader, st storage.Storage) *Pool {
 	lim := NewLimiter(4)
 	lim.Add("global:download", cfg.RateLimit.GlobalDownloads)
 	lim.Add("qq:api", cfg.NapCat.MaxConcurrentRequests)
 	return &Pool{cfg: cfg, repo: repo, napcat: nc, downloader: dl, storage: st, limiter: lim}
+}
+
+func (p *Pool) WithQueue(q *queue.RedisStream) *Pool {
+	p.queue = q
+	return p
+}
+
+func (p *Pool) Reload(cfg *config.Config, nc *napcat.Client, dl *downloader.HTTPDownloader, st storage.Storage) {
+	p.cfg = cfg
+	p.napcat = nc
+	p.downloader = dl
+	p.storage = st
+	lim := NewLimiter(4)
+	lim.Add("global:download", cfg.RateLimit.GlobalDownloads)
+	lim.Add("qq:api", cfg.NapCat.MaxConcurrentRequests)
+	p.limiter = lim
 }
 
 func (p *Pool) Start(ctx context.Context) {
@@ -43,13 +61,54 @@ func (p *Pool) Start(ctx context.Context) {
 		workers = 8
 	}
 	for i := 0; i < workers; i++ {
-		go p.run(ctx, i)
+		if p.queue != nil {
+			go p.runRedis(ctx, i)
+		} else {
+			go p.run(ctx, i)
+		}
 	}
 }
 
 func (p *Pool) Stop() {
 	if p.cancel != nil {
 		p.cancel()
+	}
+}
+
+func (p *Pool) runRedis(ctx context.Context, id int) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		msgs, err := p.queue.Read(ctx, 5*time.Second, 4)
+		if err != nil {
+			log.Printf("worker %d redis read: %v", id, err)
+			time.Sleep(time.Second)
+			continue
+		}
+		if len(msgs) == 0 {
+			continue
+		}
+		for _, msg := range msgs {
+			task, err := p.repo.ClaimTask(ctx, msg.TaskID)
+			if err != nil {
+				log.Printf("worker %d claim after redis message %s: %v", id, msg.ID, err)
+				continue
+			}
+			if task == nil {
+				_ = p.queue.Ack(ctx, msg.ID)
+				continue
+			}
+			if err := p.handle(ctx, task); err != nil {
+				log.Printf("task %d failed: %v", task.ID, err)
+				_ = p.repo.MarkFailedOrRetry(ctx, task, err)
+			} else {
+				_ = p.repo.MarkDone(ctx, task)
+			}
+			_ = p.queue.Ack(ctx, msg.ID)
+		}
 	}
 }
 

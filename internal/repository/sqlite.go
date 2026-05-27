@@ -98,9 +98,11 @@ func (s *SQLite) migrate(ctx context.Context) error {
 			pinyin TEXT,
 			initials TEXT,
 			ngrams TEXT,
+			embedding_json TEXT,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(group_id, file_id, bus_id, file_size)
 		)`,
+		`ALTER TABLE file_catalog ADD COLUMN embedding_json TEXT`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS file_catalog_fts USING fts5(
 			file_name, folder_path, normalized_text, pinyin, initials, ngrams,
 			content='file_catalog', content_rowid='id'
@@ -108,7 +110,9 @@ func (s *SQLite) migrate(ctx context.Context) error {
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return err
+			if !strings.Contains(err.Error(), "duplicate column name") {
+				return err
+			}
 		}
 	}
 	_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status = 'pending', last_error = COALESCE(last_error, '') || ' recovered after restart'
@@ -158,6 +162,27 @@ func (s *SQLite) ClaimNext(ctx context.Context) (*Task, error) {
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE tasks SET status = 'queued', updated_at = CURRENT_TIMESTAMP, started_at = COALESCE(started_at, CURRENT_TIMESTAMP) WHERE id = ?`, id); err != nil {
 		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetTask(ctx, id)
+}
+
+func (s *SQLite) ClaimTask(ctx context.Context, id int64) (*Task, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE tasks SET status = 'queued', updated_at = CURRENT_TIMESTAMP,
+		started_at = COALESCE(started_at, CURRENT_TIMESTAMP) WHERE id = ? AND status = 'pending'`, id)
+	if err != nil {
+		return nil, err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return nil, tx.Commit()
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -293,7 +318,7 @@ func (s *SQLite) IndexLocalFile(ctx context.Context, f FileCatalog) error {
 func (s *SQLite) FindLocalByName(ctx context.Context, name string) (*FileCatalog, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, group_id, COALESCE(folder_id,''), COALESCE(folder_path,''), file_id, bus_id,
-		 file_name, COALESCE(ext,''), file_size, normalized_text, pinyin, initials, ngrams, updated_at
+		 file_name, COALESCE(ext,''), file_size, normalized_text, pinyin, initials, ngrams, COALESCE(embedding_json, ''), updated_at
 		 FROM file_catalog WHERE group_id = 0 AND file_name = ? LIMIT 1`, name)
 	return scanCatalog(row)
 }
@@ -318,7 +343,7 @@ func (s *SQLite) SearchFiles(ctx context.Context, query string, groupID int64, e
 		baseWhere = " AND " + strings.Join(where, " AND ")
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.group_id, COALESCE(c.folder_id, ''), COALESCE(c.folder_path, ''), c.file_id, c.bus_id, c.file_name, COALESCE(c.ext, ''), c.file_size,
-		c.normalized_text, c.pinyin, c.initials, c.ngrams, c.updated_at, bm25(file_catalog_fts) AS rank
+		c.normalized_text, c.pinyin, c.initials, c.ngrams, COALESCE(c.embedding_json, ''), c.updated_at, bm25(file_catalog_fts) AS rank
 		FROM file_catalog_fts JOIN file_catalog c ON c.id = file_catalog_fts.rowid
 		WHERE file_catalog_fts MATCH ?`+baseWhere+` ORDER BY rank LIMIT ?`, append([]any{matchExpr}, append(args, limit)...)...)
 	if err != nil {
@@ -332,7 +357,7 @@ func (s *SQLite) SearchFiles(ctx context.Context, query string, groupID int64, e
 			return nil, err
 		}
 		score := 1 / (1 + maxFloat(rank, 0))
-		results = append(results, SearchResult{FileCatalog: *f, Score: score, Reason: "fts/pinyin"})
+		results = append(results, SearchResult{FileCatalog: *f, Score: score, TextScore: score, MatchedBy: "text", Reason: "fts/pinyin"})
 	}
 	if len(results) == 0 {
 		return s.searchLike(ctx, query, groupID, ext, limit)
@@ -354,7 +379,7 @@ func (s *SQLite) searchLike(ctx context.Context, query string, groupID int64, ex
 	}
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, `SELECT id, group_id, COALESCE(folder_id, ''), COALESCE(folder_path, ''), file_id, bus_id, file_name, COALESCE(ext, ''), file_size,
-		normalized_text, pinyin, initials, ngrams, updated_at FROM file_catalog WHERE `+strings.Join(where, " AND ")+` ORDER BY updated_at DESC LIMIT ?`, args...)
+		normalized_text, pinyin, initials, ngrams, COALESCE(embedding_json, ''), updated_at FROM file_catalog WHERE `+strings.Join(where, " AND ")+` ORDER BY updated_at DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -365,9 +390,55 @@ func (s *SQLite) searchLike(ctx context.Context, query string, groupID int64, ex
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, SearchResult{FileCatalog: *f, Score: 0.65, Reason: "fuzzy"})
+		out = append(out, SearchResult{FileCatalog: *f, Score: 0.65, TextScore: 0.65, MatchedBy: "text", Reason: "fuzzy"})
 	}
 	return out, rows.Err()
+}
+
+func (s *SQLite) ListCatalog(ctx context.Context, limit int) ([]FileCatalog, error) {
+	if limit <= 0 || limit > 10000 {
+		limit = 10000
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id, group_id, COALESCE(folder_id, ''), COALESCE(folder_path, ''), file_id, bus_id, file_name, COALESCE(ext, ''), file_size,
+		normalized_text, pinyin, initials, ngrams, COALESCE(embedding_json, ''), updated_at FROM file_catalog ORDER BY updated_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FileCatalog
+	for rows.Next() {
+		f, err := scanCatalog(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *f)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) UpdateCatalogEmbedding(ctx context.Context, id int64, embeddingJSON string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE file_catalog SET embedding_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, embeddingJSON, id)
+	return err
+}
+
+func (s *SQLite) PendingTaskIDs(ctx context.Context, limit int) ([]int64, error) {
+	if limit <= 0 || limit > 10000 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM tasks WHERE status = 'pending' ORDER BY priority ASC, created_at ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func (s *SQLite) Audit(ctx context.Context, operatorQQ, groupID int64, command, action, result, ip string) {
@@ -400,7 +471,7 @@ func scanTask(sc scanner) (*Task, error) {
 func scanCatalog(sc scanner) (*FileCatalog, error) {
 	var f FileCatalog
 	if err := sc.Scan(&f.ID, &f.GroupID, &f.FolderID, &f.FolderPath, &f.FileID, &f.BusID, &f.FileName, &f.Ext, &f.FileSize,
-		&f.NormalizedText, &f.Pinyin, &f.Initials, &f.NGrams, &f.UpdatedAt); err != nil {
+		&f.NormalizedText, &f.Pinyin, &f.Initials, &f.NGrams, &f.EmbeddingJSON, &f.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &f, nil
@@ -410,7 +481,7 @@ func scanCatalogRank(sc scanner) (*FileCatalog, float64, error) {
 	var f FileCatalog
 	var rank float64
 	if err := sc.Scan(&f.ID, &f.GroupID, &f.FolderID, &f.FolderPath, &f.FileID, &f.BusID, &f.FileName, &f.Ext, &f.FileSize,
-		&f.NormalizedText, &f.Pinyin, &f.Initials, &f.NGrams, &f.UpdatedAt, &rank); err != nil {
+		&f.NormalizedText, &f.Pinyin, &f.Initials, &f.NGrams, &f.EmbeddingJSON, &f.UpdatedAt, &rank); err != nil {
 		return nil, 0, err
 	}
 	return &f, rank, nil
