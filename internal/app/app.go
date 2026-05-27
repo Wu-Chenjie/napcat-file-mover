@@ -22,6 +22,7 @@ import (
 	"napcat-file-mover/internal/config"
 	"napcat-file-mover/internal/downloader"
 	"napcat-file-mover/internal/napcat"
+	"napcat-file-mover/internal/queue"
 	"napcat-file-mover/internal/repository"
 	"napcat-file-mover/internal/search"
 	"napcat-file-mover/internal/security"
@@ -30,24 +31,42 @@ import (
 )
 
 type Core struct {
-	cfg        *config.Config
-	repo       *repository.SQLite
-	napcat     *napcat.Client
-	gateway    *bot.Gateway
-	workers    *worker.Pool
-	storage    *storage.Local
-	server     *http.Server
-	wsListener *napcat.WSListener
-	sessions   map[string]time.Time
-	searches   map[string][]repository.SearchResult
-	sessionMu  sync.Mutex
-	searchMu   sync.Mutex
+	cfg             *config.Config
+	repo            repository.Store
+	napcat          *napcat.Client
+	gateway         *bot.Gateway
+	workers         *worker.Pool
+	storage         storage.Storage
+	queue           *queue.RedisStream
+	semantic        *search.OllamaClient
+	vectorIndex     *search.VectorIndex
+	semanticReady   bool
+	semanticError   string
+	restartRequired bool
+	lastReloadAt    time.Time
+	server          *http.Server
+	wsListener      *napcat.WSListener
+	sessions        map[string]time.Time
+	searches        map[string][]repository.SearchResult
+	sessionMu       sync.Mutex
+	searchMu        sync.Mutex
+	runtimeMu       sync.RWMutex
 }
 
 func New(cfg *config.Config) (*Core, error) {
-	repo, err := repository.OpenSQLite(cfg.Database.Path)
+	baseRepo, err := openRepository(context.Background(), cfg)
 	if err != nil {
 		return nil, err
+	}
+	var q *queue.RedisStream
+	repo := baseRepo
+	if cfg.Redis.Enabled {
+		q, err = queue.NewRedisStream(context.Background(), cfg.Redis)
+		if err != nil {
+			_ = baseRepo.Close()
+			return nil, err
+		}
+		repo = repository.NewQueuedStore(baseRepo, q)
 	}
 	timeout := time.Duration(cfg.NapCat.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -56,18 +75,62 @@ func New(cfg *config.Config) (*Core, error) {
 	nc := napcat.New(cfg.NapCat.Endpoint, cfg.NapCat.Token, timeout, cfg.NapCat.MaxConcurrentRequests)
 	maxBytes := cfg.Website.MaxFileSizeMB * 1024 * 1024
 	dl := downloader.New(cfg.Website.UserAgent, maxBytes, cfg.Worker.BufferSizeKB*1024)
-	st := storage.NewLocal(cfg.Storage.LocalRoot)
-	pool := worker.New(cfg, repo, nc, dl, st)
-	return &Core{
+	st, err := openStorage(context.Background(), cfg)
+	if err != nil {
+		_ = repo.Close()
+		if q != nil {
+			_ = q.Close()
+		}
+		return nil, err
+	}
+	pool := worker.New(cfg, repo, nc, dl, st).WithQueue(q)
+	core := &Core{
 		cfg:      cfg,
 		repo:     repo,
 		napcat:   nc,
 		gateway:  bot.NewGateway(cfg, repo, nc, st),
 		storage:  st,
+		queue:    q,
 		workers:  pool,
 		sessions: map[string]time.Time{},
 		searches: map[string][]repository.SearchResult{},
-	}, nil
+	}
+	core.configureSemantic(cfg)
+	return core, nil
+}
+
+func (c *Core) configureSemantic(cfg *config.Config) {
+	if cfg.Search.Semantic.Enabled && strings.EqualFold(cfg.Search.Semantic.Provider, "ollama") {
+		c.semantic = search.NewOllamaClient(cfg.Search.Semantic)
+		c.semanticError = ""
+		return
+	}
+	c.semantic = nil
+	c.vectorIndex = nil
+	c.semanticReady = false
+	c.semanticError = ""
+}
+
+func openRepository(ctx context.Context, cfg *config.Config) (repository.Store, error) {
+	switch strings.ToLower(cfg.Database.Driver) {
+	case "", "sqlite":
+		return repository.OpenSQLite(cfg.Database.Path)
+	case "postgres", "postgresql":
+		return repository.OpenPostgres(ctx, cfg.Database.DSN)
+	default:
+		return nil, fmt.Errorf("unsupported database.driver %q", cfg.Database.Driver)
+	}
+}
+
+func openStorage(ctx context.Context, cfg *config.Config) (storage.Storage, error) {
+	switch strings.ToLower(cfg.Storage.Type) {
+	case "", "local":
+		return storage.NewLocal(cfg.Storage.LocalRoot), nil
+	case "s3":
+		return storage.NewS3(ctx, cfg.Storage.S3)
+	default:
+		return nil, fmt.Errorf("unsupported storage.type %q", cfg.Storage.Type)
+	}
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -101,10 +164,11 @@ func defaultWSURI(endpoint string) string {
 }
 
 func (c *Core) indexLocalFiles() {
-	if c.storage == nil {
+	lister, ok := c.storage.(storage.LocalFileLister)
+	if c.storage == nil || !ok {
 		return
 	}
-	files, err := c.storage.ListLocalFiles(context.Background())
+	files, err := lister.ListLocalFiles(context.Background())
 	if err != nil {
 		log.Printf("list local files: %v", err)
 		return
@@ -130,11 +194,82 @@ func (c *Core) indexLocalFiles() {
 	log.Printf("indexed %d local files", len(files))
 }
 
+func (c *Core) refreshSemanticIndex(ctx context.Context) {
+	c.runtimeMu.RLock()
+	client := c.semantic
+	enabled := c.cfg.Search.Semantic.Enabled
+	batchSize := c.cfg.Search.Semantic.BatchSize
+	c.runtimeMu.RUnlock()
+	if !enabled || client == nil {
+		return
+	}
+	catalog, err := c.repo.ListCatalog(ctx, 10000)
+	if err != nil {
+		c.setSemanticState(nil, false, err.Error())
+		log.Printf("semantic catalog load: %v", err)
+		return
+	}
+	if batchSize <= 0 {
+		batchSize = 16
+	}
+	for i := range catalog {
+		if catalog[i].EmbeddingJSON != "" {
+			continue
+		}
+		if i > 0 && i%batchSize == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+		}
+		vec, err := client.Embed(ctx, semanticText(catalog[i]))
+		if err != nil {
+			c.setSemanticState(search.NewVectorIndex(catalog), len(catalog) > 0, err.Error())
+			log.Printf("semantic embedding fallback to text search: %v", err)
+			return
+		}
+		catalog[i].EmbeddingJSON = search.EncodeVector(vec)
+		if catalog[i].ID != 0 {
+			_ = c.repo.UpdateCatalogEmbedding(ctx, catalog[i].ID, catalog[i].EmbeddingJSON)
+		}
+	}
+	c.setSemanticState(search.NewVectorIndex(catalog), true, "")
+	log.Printf("semantic index loaded: %d catalog items", len(catalog))
+}
+
+func (c *Core) setSemanticState(idx *search.VectorIndex, ready bool, msg string) {
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	c.vectorIndex = idx
+	c.semanticReady = ready
+	c.semanticError = msg
+}
+
+func semanticText(f repository.FileCatalog) string {
+	return strings.TrimSpace(strings.Join([]string{
+		f.FileName,
+		f.FolderPath,
+		f.NormalizedText,
+		f.Pinyin,
+		f.Initials,
+	}, " "))
+}
+
 func (c *Core) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	c.routes(mux)
 	c.server = &http.Server{Addr: c.cfg.Server.Listen, Handler: corsMiddleware(mux)}
-	go c.indexLocalFiles()
+	go func() {
+		c.indexLocalFiles()
+		c.refreshSemanticIndex(ctx)
+	}()
+	if c.queue != nil {
+		go c.requeuePending(ctx)
+	}
+	if c.cfg.Reload.Enabled {
+		go c.watchConfig(ctx)
+	}
 	c.workers.Start(ctx)
 	go func() {
 		if err := c.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -169,6 +304,23 @@ func (c *Core) Stop(ctx context.Context) {
 	if c.repo != nil {
 		_ = c.repo.Close()
 	}
+	if c.queue != nil {
+		_ = c.queue.Close()
+	}
+}
+
+func (c *Core) requeuePending(ctx context.Context) {
+	ids, err := c.repo.PendingTaskIDs(ctx, 10000)
+	if err != nil {
+		log.Printf("redis requeue pending: %v", err)
+		return
+	}
+	for _, id := range ids {
+		if err := c.queue.Enqueue(ctx, id); err != nil {
+			log.Printf("redis enqueue pending task %d: %v", id, err)
+		}
+	}
+	log.Printf("redis requeued %d pending tasks", len(ids))
 }
 
 func (c *Core) routes(mux *http.ServeMux) {
@@ -178,6 +330,8 @@ func (c *Core) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/onebot/event", c.onebotEvent)
 	mux.HandleFunc("/api/auth/login", c.login)
 	mux.HandleFunc("/api/auth/logout", c.requireAuth(c.logout))
+	mux.HandleFunc("/api/runtime/status", c.requireAuth(c.runtimeStatus))
+	mux.HandleFunc("/api/config/reload", c.requireAuth(c.reloadConfig))
 	mux.HandleFunc("/api/config", c.requireAuth(c.configAPI))
 	mux.HandleFunc("/api/tasks", c.requireAuth(c.tasks))
 	mux.HandleFunc("/api/tasks/", c.requireAuth(c.taskAction))
@@ -193,9 +347,9 @@ func (c *Core) health(w http.ResponseWriter, _ *http.Request) {
 
 func (c *Core) ready(w http.ResponseWriter, _ *http.Request) {
 	checks := map[string]bool{
-		"database": fileExists(c.cfg.Database.Path),
+		"database": databaseReady(c.cfg),
 		"cache":    dirExists(c.cfg.Paths.CacheDir),
-		"files":    dirExists(c.cfg.Storage.LocalRoot),
+		"storage":  storageReady(c.cfg),
 	}
 	status := http.StatusOK
 	for _, ok := range checks {
@@ -204,6 +358,20 @@ func (c *Core) ready(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	writeJSON(w, status, checks)
+}
+
+func databaseReady(cfg *config.Config) bool {
+	if strings.EqualFold(cfg.Database.Driver, "postgres") || strings.EqualFold(cfg.Database.Driver, "postgresql") {
+		return cfg.Database.DSN != ""
+	}
+	return fileExists(cfg.Database.Path)
+}
+
+func storageReady(cfg *config.Config) bool {
+	if strings.EqualFold(cfg.Storage.Type, "s3") {
+		return cfg.Storage.S3.Bucket != ""
+	}
+	return dirExists(cfg.Storage.LocalRoot)
 }
 
 func (c *Core) metrics(w http.ResponseWriter, _ *http.Request) {
@@ -238,9 +406,8 @@ func (c *Core) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	log.Printf("login attempt: input=%q config=%q", req.Token, c.cfg.App.AdminToken)
 	if subtle.ConstantTimeCompare([]byte(req.Token), []byte(c.cfg.App.AdminToken)) != 1 {
-		msg := fmt.Sprintf("unauthorized: input=%q config=%q", req.Token, c.cfg.App.AdminToken); http.Error(w, msg, http.StatusUnauthorized)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	token, err := randomToken()
@@ -272,10 +439,13 @@ type publicConfig struct {
 	NapCat    publicNapCatConfig     `json:"napcat"`
 	Bot       config.BotConfig       `json:"bot"`
 	Website   config.WebsiteConfig   `json:"website"`
-	Storage   config.StorageConfig   `json:"storage"`
+	Database  config.DatabaseConfig  `json:"database"`
+	Redis     config.RedisConfig     `json:"redis"`
+	Storage   publicStorageConfig    `json:"storage"`
 	Worker    config.WorkerConfig    `json:"worker"`
 	RateLimit config.RateLimitConfig `json:"rate_limit"`
 	Search    config.SearchConfig    `json:"search"`
+	Reload    config.ReloadConfig    `json:"reload"`
 	Paths     config.Paths           `json:"paths"`
 }
 
@@ -293,6 +463,23 @@ type publicNapCatConfig struct {
 	RetryMaxAttempts      int    `json:"retry_max_attempts"`
 }
 
+type publicStorageConfig struct {
+	Type      string         `json:"type"`
+	LocalRoot string         `json:"local_root"`
+	S3        publicS3Config `json:"s3"`
+}
+
+type publicS3Config struct {
+	Endpoint     string `json:"endpoint"`
+	Bucket       string `json:"bucket"`
+	Region       string `json:"region"`
+	AccessKey    string `json:"access_key"`
+	SecretKeySet bool   `json:"secret_key_set"`
+	SecretKey    string `json:"secret_key,omitempty"`
+	UsePathStyle bool   `json:"use_path_style"`
+	Prefix       string `json:"prefix"`
+}
+
 func (c *Core) configAPI(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -303,75 +490,267 @@ func (c *Core) configAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := c.updateConfig(req); err != nil {
+		next, err := c.updatedConfig(req)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := config.Save(c.cfg); err != nil {
+		if err := config.Save(next); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": true, "config": c.publicConfig()})
+		restart, err := c.applyReload(r.Context(), next)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": restart, "config": c.publicConfig()})
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 
+func (c *Core) runtimeStatus(w http.ResponseWriter, _ *http.Request) {
+	c.runtimeMu.RLock()
+	status := map[string]any{
+		"database": map[string]any{
+			"driver": c.cfg.Database.Driver,
+		},
+		"queue": map[string]any{
+			"type":    queueType(c.cfg),
+			"enabled": c.queue != nil,
+			"stream":  c.cfg.Redis.Stream,
+		},
+		"storage": map[string]any{
+			"type": c.cfg.Storage.Type,
+		},
+		"semantic_search": map[string]any{
+			"enabled":  c.cfg.Search.Semantic.Enabled,
+			"provider": c.cfg.Search.Semantic.Provider,
+			"model":    c.cfg.Search.Semantic.Model,
+			"ready":    c.semanticReady,
+			"error":    c.semanticError,
+		},
+		"reload": map[string]any{
+			"enabled":          c.cfg.Reload.Enabled,
+			"restart_required": c.restartRequired,
+			"last_reload_at":   c.lastReloadAt,
+		},
+	}
+	c.runtimeMu.RUnlock()
+	writeJSON(w, http.StatusOK, status)
+}
+
+func queueType(cfg *config.Config) string {
+	if cfg.Redis.Enabled {
+		return "redis_stream"
+	}
+	return "database_polling"
+}
+
+func (c *Core) reloadConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	restart, err := c.reloadFromDisk(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": restart, "config": c.publicConfig()})
+}
+
 func (c *Core) publicConfig() publicConfig {
 	return publicConfig{
-		App:       publicAppConfig{AdminTokenSet: c.cfg.App.AdminToken != ""},
-		Server:    c.cfg.Server,
-		NapCat:    publicNapCatConfig{Endpoint: c.cfg.NapCat.Endpoint, TokenSet: c.cfg.NapCat.Token != "", TimeoutSeconds: c.cfg.NapCat.TimeoutSeconds, MaxConcurrentRequests: c.cfg.NapCat.MaxConcurrentRequests, RetryMaxAttempts: c.cfg.NapCat.RetryMaxAttempts},
-		Bot:       c.cfg.Bot,
-		Website:   c.cfg.Website,
-		Storage:   c.cfg.Storage,
+		App:      publicAppConfig{AdminTokenSet: c.cfg.App.AdminToken != ""},
+		Server:   c.cfg.Server,
+		NapCat:   publicNapCatConfig{Endpoint: c.cfg.NapCat.Endpoint, TokenSet: c.cfg.NapCat.Token != "", TimeoutSeconds: c.cfg.NapCat.TimeoutSeconds, MaxConcurrentRequests: c.cfg.NapCat.MaxConcurrentRequests, RetryMaxAttempts: c.cfg.NapCat.RetryMaxAttempts},
+		Bot:      c.cfg.Bot,
+		Website:  c.cfg.Website,
+		Database: c.cfg.Database,
+		Redis:    c.cfg.Redis,
+		Storage: publicStorageConfig{
+			Type:      c.cfg.Storage.Type,
+			LocalRoot: c.cfg.Storage.LocalRoot,
+			S3: publicS3Config{
+				Endpoint:     c.cfg.Storage.S3.Endpoint,
+				Bucket:       c.cfg.Storage.S3.Bucket,
+				Region:       c.cfg.Storage.S3.Region,
+				AccessKey:    c.cfg.Storage.S3.AccessKey,
+				SecretKeySet: c.cfg.Storage.S3.SecretKey != "",
+				UsePathStyle: c.cfg.Storage.S3.UsePathStyle,
+				Prefix:       c.cfg.Storage.S3.Prefix,
+			},
+		},
 		Worker:    c.cfg.Worker,
 		RateLimit: c.cfg.RateLimit,
 		Search:    c.cfg.Search,
+		Reload:    c.cfg.Reload,
 		Paths:     c.cfg.Paths,
 	}
 }
 
-func (c *Core) updateConfig(req publicConfig) error {
+func (c *Core) reloadFromDisk(ctx context.Context) (bool, error) {
+	next, err := config.Load(c.cfg.Paths.Config)
+	if err != nil {
+		return false, err
+	}
+	return c.applyReload(ctx, next)
+}
+
+func (c *Core) applyReload(ctx context.Context, next *config.Config) (bool, error) {
+	c.runtimeMu.Lock()
+	current := c.cfg
+	restart := immutableChanged(current, next)
+	c.runtimeMu.Unlock()
+
+	timeout := time.Duration(next.NapCat.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	nc := napcat.New(next.NapCat.Endpoint, next.NapCat.Token, timeout, next.NapCat.MaxConcurrentRequests)
+	maxBytes := next.Website.MaxFileSizeMB * 1024 * 1024
+	dl := downloader.New(next.Website.UserAgent, maxBytes, next.Worker.BufferSizeKB*1024)
+
+	var st storage.Storage
+	if !restart || strings.EqualFold(current.Storage.Type, next.Storage.Type) {
+		var err error
+		st, err = openStorage(ctx, next)
+		if err != nil {
+			return restart, err
+		}
+	} else {
+		st = c.storage
+	}
+
+	c.runtimeMu.Lock()
+	*c.cfg = *next
+	c.napcat = nc
+	c.storage = st
+	c.restartRequired = restart
+	c.lastReloadAt = time.Now()
+	c.configureSemantic(c.cfg)
+	c.runtimeMu.Unlock()
+
+	c.gateway.Reload(c.cfg, nc, st)
+	c.workers.Reload(c.cfg, nc, dl, st)
+	if c.cfg.Search.Semantic.Enabled {
+		go c.refreshSemanticIndex(ctx)
+	}
+	return restart, nil
+}
+
+func immutableChanged(a, b *config.Config) bool {
+	if a.Server.Listen != b.Server.Listen {
+		return true
+	}
+	if !strings.EqualFold(a.Database.Driver, b.Database.Driver) || a.Database.Path != b.Database.Path || a.Database.DSN != b.Database.DSN {
+		return true
+	}
+	if a.Redis.Enabled != b.Redis.Enabled || a.Redis.Addr != b.Redis.Addr || a.Redis.DB != b.Redis.DB ||
+		a.Redis.Stream != b.Redis.Stream || a.Redis.ConsumerGroup != b.Redis.ConsumerGroup {
+		return true
+	}
+	return !strings.EqualFold(a.Storage.Type, b.Storage.Type)
+}
+
+func (c *Core) watchConfig(ctx context.Context) {
+	path := c.cfg.Paths.Config
+	info, err := os.Stat(path)
+	if err != nil {
+		return
+	}
+	lastMod := info.ModTime()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			info, err := os.Stat(path)
+			if err != nil || !info.ModTime().After(lastMod) {
+				continue
+			}
+			lastMod = info.ModTime()
+			debounce := time.Duration(c.cfg.Reload.DebounceMS) * time.Millisecond
+			if debounce <= 0 {
+				debounce = 500 * time.Millisecond
+			}
+			timer := time.NewTimer(debounce)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			restart, err := c.reloadFromDisk(ctx)
+			if err != nil {
+				log.Printf("config hot reload failed: %v", err)
+				continue
+			}
+			log.Printf("config hot reloaded restart_required=%v", restart)
+		}
+	}
+}
+
+func (c *Core) updatedConfig(req publicConfig) (*config.Config, error) {
 	if req.Server.Listen == "" {
-		return errors.New("server.listen is required")
+		return nil, errors.New("server.listen is required")
 	}
 	if req.NapCat.Endpoint == "" {
-		return errors.New("napcat.endpoint is required")
+		return nil, errors.New("napcat.endpoint is required")
 	}
 	if req.Website.MaxFileSizeMB <= 0 {
-		return errors.New("website.max_file_size_mb must be positive")
+		return nil, errors.New("website.max_file_size_mb must be positive")
 	}
 	if req.Worker.MaxActiveTasks <= 0 || req.Worker.BufferSizeKB <= 0 || req.Worker.MaxRetries < 0 {
-		return errors.New("worker settings are invalid")
+		return nil, errors.New("worker settings are invalid")
 	}
 	if req.Search.HighConfidence <= 0 || req.Search.HighConfidence > 1 {
-		return errors.New("search.high_confidence must be between 0 and 1")
+		return nil, errors.New("search.high_confidence must be between 0 and 1")
 	}
 	if req.Search.MaxBatchFiles <= 0 || req.Search.MaxBatchSizeMB <= 0 {
-		return errors.New("search batch limits must be positive")
+		return nil, errors.New("search batch limits must be positive")
 	}
-	c.cfg.Server = req.Server
-	c.cfg.NapCat.Endpoint = req.NapCat.Endpoint
-	c.cfg.NapCat.TimeoutSeconds = req.NapCat.TimeoutSeconds
-	c.cfg.NapCat.MaxConcurrentRequests = req.NapCat.MaxConcurrentRequests
-	c.cfg.NapCat.RetryMaxAttempts = req.NapCat.RetryMaxAttempts
+	c.runtimeMu.RLock()
+	next := *c.cfg
+	c.runtimeMu.RUnlock()
+	next.Server = req.Server
+	next.NapCat.Endpoint = req.NapCat.Endpoint
+	next.NapCat.TimeoutSeconds = req.NapCat.TimeoutSeconds
+	next.NapCat.MaxConcurrentRequests = req.NapCat.MaxConcurrentRequests
+	next.NapCat.RetryMaxAttempts = req.NapCat.RetryMaxAttempts
 	if req.NapCat.Token != "" {
-		c.cfg.NapCat.Token = req.NapCat.Token
+		next.NapCat.Token = req.NapCat.Token
 	}
 	if req.App.AdminToken != "" {
-		c.cfg.App.AdminToken = req.App.AdminToken
+		next.App.AdminToken = req.App.AdminToken
 	}
-	c.cfg.Bot = req.Bot
-	c.cfg.Website = req.Website
-	c.cfg.Storage = req.Storage
-	c.cfg.Worker = req.Worker
-	c.cfg.RateLimit = req.RateLimit
-	c.cfg.Search = req.Search
-	if c.cfg.Storage.LocalRoot == "" {
-		c.cfg.Storage.LocalRoot = c.cfg.Paths.FilesDir
+	next.Bot = req.Bot
+	next.Website = req.Website
+	next.Database = req.Database
+	next.Redis = req.Redis
+	next.Storage.Type = req.Storage.Type
+	next.Storage.LocalRoot = req.Storage.LocalRoot
+	next.Storage.S3.Endpoint = req.Storage.S3.Endpoint
+	next.Storage.S3.Bucket = req.Storage.S3.Bucket
+	next.Storage.S3.Region = req.Storage.S3.Region
+	next.Storage.S3.AccessKey = req.Storage.S3.AccessKey
+	next.Storage.S3.UsePathStyle = req.Storage.S3.UsePathStyle
+	next.Storage.S3.Prefix = req.Storage.S3.Prefix
+	if req.Storage.S3.SecretKey != "" {
+		next.Storage.S3.SecretKey = req.Storage.S3.SecretKey
 	}
-	return nil
+	next.Worker = req.Worker
+	next.RateLimit = req.RateLimit
+	next.Search = req.Search
+	next.Reload = req.Reload
+	if next.Storage.LocalRoot == "" {
+		next.Storage.LocalRoot = next.Paths.FilesDir
+	}
+	return &next, nil
 }
 
 func (c *Core) tasks(w http.ResponseWriter, r *http.Request) {
@@ -468,6 +847,20 @@ func (c *Core) searchFiles(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	c.runtimeMu.RLock()
+	semanticClient := c.semantic
+	vectorIndex := c.vectorIndex
+	semanticEnabled := c.cfg.Search.Semantic.Enabled
+	c.runtimeMu.RUnlock()
+	if semanticEnabled && semanticClient != nil && vectorIndex != nil {
+		if vec, err := semanticClient.Embed(r.Context(), q); err == nil {
+			semanticResults := vectorIndex.Search(vec, groupID, r.URL.Query().Get("ext"), limit)
+			results = search.MergeResults(results, semanticResults, limit)
+		} else {
+			c.setSemanticState(vectorIndex, false, err.Error())
+			log.Printf("semantic query fallback to text search: %v", err)
+		}
 	}
 	id, _ := randomToken()
 	c.searchMu.Lock()

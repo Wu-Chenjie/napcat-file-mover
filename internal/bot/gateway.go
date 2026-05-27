@@ -35,10 +35,10 @@ func isDocFile(name string) bool {
 
 type Gateway struct {
 	cfg         *config.Config
-	repo        *repository.SQLite
+	repo        repository.Store
 	napcat      *napcat.Client
 	resolver    *websource.Resolver
-	storage     *storage.Local
+	storage     storage.Storage
 	botUserID   string
 	botNickname string
 }
@@ -53,13 +53,20 @@ type qqCandidate struct {
 	FileSize   int64
 }
 
-func NewGateway(cfg *config.Config, repo *repository.SQLite, nc *napcat.Client, st *storage.Local) *Gateway {
+func NewGateway(cfg *config.Config, repo repository.Store, nc *napcat.Client, st storage.Storage) *Gateway {
 	return &Gateway{
 		cfg:      cfg,
 		repo:     repo,
 		napcat:   nc,
 		resolver: websource.NewResolver(websource.Options{}),
+		storage:  st,
 	}
+}
+
+func (g *Gateway) Reload(cfg *config.Config, nc *napcat.Client, st storage.Storage) {
+	g.cfg = cfg
+	g.napcat = nc
+	g.storage = st
 }
 
 func (g *Gateway) HandleEvent(ctx context.Context, ev napcat.OneBotEvent, ip string) {
@@ -72,6 +79,10 @@ func (g *Gateway) HandleEvent(ctx context.Context, ev napcat.OneBotEvent, ip str
 		return
 	}
 	isAdmin := security.ContainsInt64(g.cfg.Bot.Admins, ev.UserID)
+	if cmd.Name == "help" || cmd.Name == "帮助" {
+		g.reply(ctx, ev.GroupID, helpMessage())
+		return
+	}
 	if !security.ContainsInt64(g.cfg.Bot.AllowedGroups, ev.GroupID) {
 		g.reply(ctx, ev.GroupID, "当前群不在白名单")
 		return
@@ -424,13 +435,13 @@ func (g *Gateway) handleSearch(ctx context.Context, cmd Command) (string, error)
 	}
 	var b strings.Builder
 	b.WriteString("匹配文件:\n")
-		for i, r := range results {
-			src := fmt.Sprintf(" [群%d]", r.GroupID)
-			if r.GroupID == 0 {
-				src = " [本地]"
-			}
-			fmt.Fprintf(&b, "%d. %s (%s, score %.2f)%s\n", i+1, r.FileName, formatSize(r.FileSize), r.Score, src)
+	for i, r := range results {
+		src := fmt.Sprintf(" [群%d]", r.GroupID)
+		if r.GroupID == 0 {
+			src = " [本地]"
 		}
+		fmt.Fprintf(&b, "%d. %s (%s, score %.2f)%s\n", i+1, r.FileName, formatSize(r.FileSize), r.Score, src)
+	}
 	return strings.TrimSpace(b.String()), nil
 }
 

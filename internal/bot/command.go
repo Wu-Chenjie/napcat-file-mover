@@ -22,14 +22,23 @@ type Command struct {
 
 func Parse(raw string, userID, groupID int64) (Command, bool) {
 	raw = strings.TrimSpace(raw)
-	if !strings.HasPrefix(raw, "/") {
+	prefix := ""
+	switch {
+	case strings.HasPrefix(raw, "/"):
+		prefix = "/"
+	case strings.HasPrefix(strings.ToLower(raw), "#napcat"):
+		raw = strings.TrimSpace("#help" + strings.TrimPrefix(raw, raw[:len("#napcat")]))
+		prefix = "#"
+	case strings.HasPrefix(raw, "#"):
+		prefix = "#"
+	default:
 		return Command{}, false
 	}
 	parts := strings.Fields(raw)
 	if len(parts) == 0 {
 		return Command{}, false
 	}
-	return Command{Name: strings.TrimPrefix(parts[0], "/"), Args: parts[1:], Raw: raw, UserID: userID, GroupID: groupID}, true
+	return Command{Name: strings.TrimPrefix(parts[0], prefix), Args: parts[1:], Raw: raw, UserID: userID, GroupID: groupID}, true
 }
 
 func WebTask(cmd Command, allowedHosts []string, maxRetries int) (*repository.Task, error) {
